@@ -1,0 +1,196 @@
+# ============================================
+# Mock Interview Platform - .gitignore
+# ============================================
+
+# ==================== Python ====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+env/
+venv/
+ENV/
+.venv/
+mock_interview_audio_api/app/env/
+
+# ==================== Environment & Secrets ====================
+.env
+.env.local
+.env.*.local
+*.env
+.envrc
+
+# API Keys (never commit these!)
+**/secrets.py
+**/credentials.py
+
+# ==================== Django ====================
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+staticfiles/
+media/
+*.pot
+*.mo
+
+# ==================== Docker ====================
+.dockerenv
+.docker/
+*.tar
+
+# ==================== IDE & Editors ====================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# ==================== Generated Analysis Files ====================
+# Dlib container analysis outputs (regenerated on each interview)
+dlib_video/interview_results/*.json
+dlib_video/COMBINED_*.json
+dlib_video/logs/
+dlib_video/open_cv/*.dat
+
+# Audio API outputs
+mock_interview_audio_api/app/output/
+mock_interview_audio_api/app/audio/
+mock_interview_audio_api/app/*.json
+
+# ==================== Log Files ====================
+*.log
+logs/
+*.log.*
+interview.log
+
+# ==================== Temporary Files ====================
+*.tmp
+*.temp
+*.bak
+*.backup
+.cache/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# ==================== OS Generated ====================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ==================== Jupyter Notebooks ====================
+.ipynb_checkpoints/
+*.ipynb
+
+# ==================== Documentation Outputs ====================
+# Documentation generator scripts and outputs
+Mock_Interview_Platform_Documentation.docx
+mock_interview_flow.drawio.xml
+generate_documentation.py
+generate_complete_documentation.py
+
+# ==================== Archived Data (Optional) ====================
+# Uncomment if you don't want to track archived old audio responses
+# mock_interview_latest/app/_archived/old_data/audio_responses/
+
+# ==================== Node (if any frontend tooling) ====================
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# ==================== Compiled Files ====================
+*.com
+*.class
+*.dll
+*.exe
+*.o
+*.so
+
+# ==================== Test & Coverage ====================
+.coverage
+.pytest_cache/
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# ==================== mypy ====================
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# ==================== Audio/Video Files ====================
+# Audio files (interview recordings)
+*.webm
+*.wav
+*.mp3
+*.ogg
+*.flac
+*.aac
+*.m4a
+*.wma
+
+
+
+# Video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.wmv
+*.flv
+
+# Audio responses directories
+**/audio_responses/
+**/audio/
+**/recordings/
+
+# ==================== Large Binary Files ====================
+# Dlib model files
+*.dat
+*.pkl
+*.h5
+*.model
+
+# Compressed archives
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tgz
+*.zip
+*.rar
+*.7z
+
+
+
