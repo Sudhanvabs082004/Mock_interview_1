@@ -3140,3 +3140,51 @@ def download_student_report(request, interview_id):
 
 
     return response
+# ============================================
+# STUDENT RESULTS PAGE VIEW
+# ============================================
+
+@login_required
+def interview_results(request, interview_id):
+    """
+    Display interview results page
+    - Student can see their own
+    - Admin can see any
+    """
+
+    if request.user.is_staff:
+        interview = get_object_or_404(Interview, id=interview_id)
+    else:
+        interview = get_object_or_404(
+            Interview,
+            id=interview_id,
+            student=request.user
+        )
+
+    return render(request, 'interview_system/interview_results.html', {
+        'interview': interview
+    })
+from django.views.decorators.http import require_POST
+
+@staff_member_required
+@require_POST
+def delete_interview(request, interview_id):
+    """
+    Delete an interview (Admin only)
+    """
+    try:
+        interview = get_object_or_404(Interview, id=interview_id)
+
+        interview.delete()
+
+        return JsonResponse({
+            'success': True,
+            'message': 'Interview deleted successfully'
+        })
+
+    except Exception as e:
+        logger.error(f"Error deleting interview {interview_id}: {e}")
+        return JsonResponse({
+            'success': False,
+            'error': 'Failed to delete interview'
+        }, status=500)
