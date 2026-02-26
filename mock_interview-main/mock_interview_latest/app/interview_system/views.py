@@ -75,11 +75,11 @@ User = get_user_model()
 # Try to import Kafka client, but don't fail if it's not available yet
 try:
     from utils.kafka_client import KafkaFrameClient
-    KAFKA_AVAILABLE = False
+    KAFKA_AVAILABLE = True
+    logger.info("✅ Kafka client loaded successfully")
 except ImportError:
     KAFKA_AVAILABLE = False
-    logger.warning("Kafka client not available, using HDFS only")
-
+    logger.warning("⚠️ Kafka client not available, using HDFS only")
 
 #Time zone related functions
 def get_ist_now():
@@ -679,22 +679,24 @@ def start_interview(request, interview_id):
 def stream_frame(request):
     """Stream a single frame to Kafka in real-time"""
     try:
+        print("🔥 STREAM_FRAME VIEW HIT")
+
         if not request.user.is_authenticated:
+            print("❌ User not authenticated")
             return JsonResponse({'error': 'Authentication required'}, status=401)
 
-        # Get latest interview (ignore status)
         interview = Interview.objects.filter(
             student=request.user
         ).order_by('-id').first()
 
         if not interview:
-            # Do NOT return 404 (prevents frontend spam)
+            print("❌ No interview found")
             return JsonResponse({'success': False, 'message': 'No interview found'})
 
-        # Parse JSON safely
         try:
             data = json.loads(request.body)
         except Exception:
+            print("❌ Invalid JSON received")
             return JsonResponse({'success': False, 'message': 'Invalid JSON'})
 
         frame_data = data.get('frame_data')
@@ -703,24 +705,33 @@ def stream_frame(request):
         height = data.get('height', 0)
 
         if not frame_data:
+            print("❌ No frame data provided")
             return JsonResponse({'success': False, 'message': 'No frame data provided'})
 
-        # Get Kafka session
+        print(f"✅ Frame received | Frame #{frame_number}")
+
         frames_record = InterviewFrames.objects.filter(
             interview=interview
         ).first()
 
         if not frames_record or not frames_record.kafka_session_id:
-            # Do NOT return 404
+            print("❌ Kafka session not ready")
             return JsonResponse({'success': False, 'message': 'Kafka session not ready'})
+
+        print(f"✅ Kafka session ID: {frames_record.kafka_session_id}")
 
         success = False
 
+        print(f"🔍 KAFKA_AVAILABLE = {KAFKA_AVAILABLE}")
+
         if KAFKA_AVAILABLE:
             try:
+                print("🚀 Initializing Kafka client...")
                 kafka_client = KafkaFrameClient()
 
                 if kafka_client.is_connected():
+                    print("✅ Kafka client connected")
+
                     success = kafka_client.send_frame(
                         session_id=frames_record.kafka_session_id,
                         frame_number=frame_number,
@@ -729,17 +740,27 @@ def stream_frame(request):
                         height=height
                     )
 
+                    print(f"📤 Kafka send_frame result: {success}")
+
                     if success:
                         frames_record.total_frames = max(
                             frames_record.total_frames,
                             frame_number + 1
                         )
                         frames_record.save(update_fields=['total_frames'])
+                        print("💾 Frame count updated")
+
+                else:
+                    print("❌ Kafka client NOT connected")
 
                 kafka_client.close()
+                print("🔒 Kafka client closed")
 
             except Exception as kafka_error:
-                print("Kafka Frame Error:", str(kafka_error))
+                print("❌ Kafka Frame Error:", str(kafka_error))
+
+        else:
+            print("❌ KAFKA_AVAILABLE is False")
 
         return JsonResponse({
             'success': success,
@@ -748,9 +769,8 @@ def stream_frame(request):
         })
 
     except Exception as e:
-        print("STREAM_FRAME ERROR:", str(e))
+        print("🚨 STREAM_FRAME ERROR:", str(e))
         return JsonResponse({'success': False})
-
 # NEW VIDEO RECORDING ENDPOINTS
 
 @csrf_exempt
@@ -809,13 +829,15 @@ def stream_video_chunk(request):
 
                 if kafka_client.is_connected():
                     success = kafka_client.send_video_chunk(
-                        session_id=video_session_id,
-                        chunk_number=chunk_number,
-                        video_data_b64=video_data,
-                        chunk_size=chunk_size,
-                        timestamp=timestamp,
-                        mime_type=mime_type
-                    )
+    session_id=video_session_id,
+    chunk_number=chunk_number,
+    video_data_b64=video_data,
+    chunk_size=chunk_size,
+    timestamp=timestamp,
+    mime_type=mime_type,
+    interview_id=interview.id,
+    user_id=request.user.id
+)
 
                     if success:
                         frames_record.total_video_chunks = max(

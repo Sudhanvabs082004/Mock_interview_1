@@ -29,12 +29,11 @@ class KafkaFrameClient:
         self.config = getattr(settings, 'KAFKA_CONFIG', {
             # Use internal Docker network communication (containers to containers)
             'bootstrap_servers': [
-                'kafka-frames:9092',     # Internal Docker network (primary)
-                '172.18.0.14:9092'       # Direct container IP (backup)
+                'localhost:9092'   
             ],
             'frame_topic': 'interview-frames',
             'video_topic': 'interview-videos',
-            'timeout': 30
+            'timeout': 10
         })
 
         # Ensure bootstrap_servers is a list

@@ -93,7 +93,7 @@ DB_CONFIG = {
 
 KAFKA_TOPIC = 'interview-frames'
 KAFKA_CONFIG = {
-    'bootstrap_servers': ['kafka-frames:9092'],
+    'bootstrap_servers': ['127.0.0.1:9092'],  # ✅ FIXED
     'auto_offset_reset': 'earliest',
     'consumer_timeout_ms': 150000,
     'group_id': None,
@@ -1406,6 +1406,9 @@ class CombinedInterviewAnalyzer:
             max_scan_time = 300  # 5 minutes
 
             for message_batch in consumer:
+                print("🔥 RAW RECORD OBJECT:", message_batch)
+                print("🔥 RAW VALUE:", message_batch.value)
+                print("🔥 VALUE TYPE:", type(message_batch.value))
                 if time.time() - scan_start_time > max_scan_time:
                     logger.warning(f"⏰ Kafka scan timeout after {max_scan_time}s")
                     break
