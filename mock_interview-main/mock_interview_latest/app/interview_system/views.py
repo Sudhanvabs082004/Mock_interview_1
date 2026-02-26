@@ -2731,7 +2731,8 @@ class VoiceInterviewAgent:
 @csrf_exempt
 @require_http_methods(["POST"])
 def start_voice_interview(request):
-    """Initialize voice interview session using CSV questions only"""
+    """Initialize voice interview session using CSV questions only with TTS"""
+
     try:
         if not request.user.is_authenticated:
             return JsonResponse({'error': 'Authentication required'}, status=401)
@@ -2764,6 +2765,45 @@ def start_voice_interview(request):
             interview.voice_interview_started = True
             interview.save(update_fields=['voice_interview_started'])
 
+        # =========================
+        # FETCH FIRST QUESTION FROM CSV
+        # =========================
+        question_obj = get_random_question(interview)
+
+        if not question_obj:
+            return JsonResponse({
+                'success': False,
+                'error': 'No questions available'
+            })
+
+        # Update session with first question
+        voice_session.current_question_number = 1
+        voice_session.current_stage = 'technical'
+        voice_session.session_data['current_question'] = question_obj.question_text
+        voice_session.session_data['current_question_id'] = str(question_obj.id)
+        voice_session.save()
+
+        # =========================
+        # 🔥 GENERATE TTS FOR FIRST QUESTION
+        # =========================
+        agent = VoiceInterviewAgent()
+        audio_base64 = agent.text_to_speech_gtts(question_obj.question_text)
+
+        return JsonResponse({
+            'success': True,
+            'question': question_obj.question_text,
+            'question_id': str(question_obj.id),
+            'question_number': 1,
+            'stage': voice_session.current_stage,
+            'session_id': voice_session.id,
+            'total_questions': interview.total_questions,
+            'has_audio': audio_base64 is not None,
+            'audio_base64': audio_base64,
+        })
+
+    except Exception as e:
+        logger.error(f"Error starting voice interview: {e}", exc_info=True)
+        return JsonResponse({'error': str(e)}, status=500)
         # ============================
         # GET FIRST QUESTION FROM CSV
         # ============================
@@ -2814,7 +2854,8 @@ def start_voice_interview(request):
 @csrf_exempt
 @require_http_methods(["POST"])
 def process_voice_response(request):
-    """Process voice response using Gemini STT and fetch next question from CSV"""
+    """Process voice response using Gemini STT and fetch next question from CSV with TTS"""
+
     try:
         if not request.user.is_authenticated:
             return JsonResponse({'error': 'Authentication required'}, status=401)
@@ -2896,7 +2937,7 @@ def process_voice_response(request):
 
                     InterviewResponse.objects.create(
                         interview=interview,
-                        question=question_obj,   # ✅ CORRECT FIELD
+                        question=question_obj,
                         audio_file_path=hdfs_audio_path,
                         local_file_path=None
                     )
@@ -2938,11 +2979,18 @@ def process_voice_response(request):
                     'error': 'No more questions available'
                 })
 
+            # Update session with new question
             voice_session.current_question_number = next_question_number
             voice_session.current_stage = 'technical'
             voice_session.session_data['current_question'] = question_obj.question_text
             voice_session.session_data['current_question_id'] = str(question_obj.id)
             voice_session.save()
+
+            # =========================
+            # 🔥 GENERATE TTS AUDIO FOR NEXT QUESTION
+            # =========================
+            agent = VoiceInterviewAgent()
+            audio_base64 = agent.text_to_speech_gtts(question_obj.question_text)
 
             return JsonResponse({
                 'success': True,
@@ -2953,7 +3001,9 @@ def process_voice_response(request):
                 'progress_percentage': int(
                     (next_question_number / interview.total_questions) * 100
                 ),
-                'interview_complete': False
+                'interview_complete': False,
+                'audio_base64': audio_base64,
+                'has_audio': audio_base64 is not None
             })
 
         finally:
@@ -2963,7 +3013,6 @@ def process_voice_response(request):
     except Exception as e:
         logger.error(f"Error processing voice response: {e}", exc_info=True)
         return JsonResponse({'error': str(e)}, status=500)
-
 @require_http_methods(["GET"])
 def get_voice_interview_status(request, interview_id):
     """Get voice interview status"""
