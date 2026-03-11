@@ -21,22 +21,35 @@ import tempfile
 import os
 import base64
 import io
+import hashlib
 import pytz
 import requests
+import threading
+import re
 
 from dotenv import load_dotenv
 import random
+from django.db import close_old_connections
 
 from .models import Interview, InterviewResponse, InterviewFrames, VoiceInterviewSession, Question
 from utils.hdfs_client import HDFSClient
 
-def get_random_question(interview):
+HTTP_SESSION = requests.Session()
+TTS_CACHE_DIR = os.path.join(settings.MEDIA_ROOT, 'tts_cache')
+LOCAL_AUDIO_RESPONSES_DIR = os.path.join(settings.MEDIA_ROOT, 'audio_responses')
+SERVER_TTS_ENABLED = getattr(settings, 'VOICE_INTERVIEW_TTS_ENABLED', False)
+INTERVIEW_ANALYSIS_MODEL = settings.OPENROUTER_CONFIG.get('MODEL', 'deepseek/deepseek-r1-0528')
+
+
+def get_random_question(interview, excluded_question_ids=None):
     """
     Fetch a random question from Question model
     excluding already asked questions.
     """
     # Get already asked question IDs
-    asked_ids = interview.responses.values_list('question__id', flat=True)
+    asked_ids = set(interview.responses.values_list('question__id', flat=True))
+    if excluded_question_ids:
+        asked_ids.update(excluded_question_ids)
 
     # Exclude already asked
     available_questions = Question.objects.exclude(id__in=asked_ids)
@@ -45,6 +58,242 @@ def get_random_question(interview):
         return None
 
     return random.choice(available_questions)
+
+
+def _ensure_directory(path):
+    os.makedirs(path, exist_ok=True)
+
+
+def _save_audio_locally(interview, question_number, audio_bytes):
+    _ensure_directory(LOCAL_AUDIO_RESPONSES_DIR)
+    interview_dir = os.path.join(LOCAL_AUDIO_RESPONSES_DIR, f"interview_{interview.id}")
+    _ensure_directory(interview_dir)
+    filename = f"question_{question_number}_{timezone.now().strftime('%Y%m%d_%H%M%S_%f')}.webm"
+    local_path = os.path.join(interview_dir, filename)
+
+    with open(local_path, 'wb') as audio_file:
+        audio_file.write(audio_bytes)
+
+    return local_path
+
+
+def _upload_audio_to_hdfs_in_background(response_id, interview_id, question_number, local_audio_path):
+    close_old_connections()
+    try:
+        response_record = InterviewResponse.objects.select_related('interview').get(id=response_id)
+        hdfs_client = HDFSClient()
+        if not hdfs_client.is_connected():
+            logger.warning("Skipping HDFS upload because HDFS is unavailable")
+            return
+
+        with open(local_audio_path, 'rb') as audio_file:
+            audio_bytes = audio_file.read()
+
+        hdfs_audio_path = (
+            f"/student_audio_responses/"
+            f"interview_{interview_id}/"
+            f"question_{question_number}.webm"
+        )
+
+        if hdfs_client.write_file(hdfs_audio_path, audio_bytes):
+            response_record.audio_file_path = hdfs_audio_path
+            response_record.save(update_fields=['audio_file_path'])
+            logger.info(f"Background HDFS upload completed for response {response_id}")
+    except Exception as exc:
+        logger.error(f"Background HDFS upload failed for response {response_id}: {exc}")
+    finally:
+        close_old_connections()
+
+
+def _build_question_audio_payload(agent, question_text):
+    if not SERVER_TTS_ENABLED:
+        return {
+            'has_audio': False,
+            'audio_base64': None,
+        }
+
+    audio_base64 = agent.text_to_speech_gtts(question_text)
+    return {
+        'has_audio': audio_base64 is not None,
+        'audio_base64': audio_base64,
+    }
+
+
+def _append_interview_context(voice_session, question_obj, transcription):
+    context_entries = voice_session.interview_context if isinstance(voice_session.interview_context, list) else []
+    context_entries.append({
+        'question_number': voice_session.current_question_number,
+        'question_id': str(question_obj.id),
+        'ai_question': question_obj.question_text,
+        'response': transcription,
+        'timestamp': timezone.now().isoformat(),
+        'audio_file_saved': True,
+    })
+    voice_session.interview_context = context_entries
+    voice_session.save(update_fields=['interview_context', 'updated_at'])
+
+
+def _build_interview_analysis_prompt(interview, context_entries):
+    response_blocks = []
+    for entry in context_entries:
+        response_blocks.append(
+            f"Question {entry.get('question_number')}:\n"
+            f"Prompt: {entry.get('ai_question', '')}\n"
+            f"Candidate answer: {entry.get('response', '')}\n"
+        )
+
+    compiled_responses = "\n".join(response_blocks)
+    return f"""
+You are evaluating a completed mock technical interview for a data science / machine learning candidate.
+
+Interview metadata:
+- Interview ID: {interview.id}
+- Total questions answered: {len(context_entries)}
+
+Evaluate the candidate only from the question/answer transcript below.
+Return a strict JSON object with scores from 0 to 100 and concise bullet-style feedback.
+
+Transcript:
+{compiled_responses}
+
+Required JSON format:
+{{
+  "technical_score": <0-100 number>,
+  "communication_score": <0-100 number>,
+  "confidence_score": <0-100 number>,
+  "overall_score": <0-100 number>,
+  "strengths": ["short point", "short point"],
+  "improvements": ["short point", "short point"],
+  "summary": "2-4 sentence summary"
+}}
+"""
+
+
+def _fallback_interview_scores(context_entries):
+    answered = [entry for entry in context_entries if entry.get('response')]
+    avg_length = sum(len(entry.get('response', '').split()) for entry in answered) / max(len(answered), 1)
+    technical_score = min(85.0, max(35.0, 35.0 + avg_length * 2.2))
+    communication_score = min(90.0, max(40.0, 40.0 + avg_length * 1.8))
+    confidence_score = min(88.0, max(38.0, 38.0 + avg_length * 1.6))
+    overall_score = round((technical_score * 0.5) + (communication_score * 0.3) + (confidence_score * 0.2), 1)
+    return {
+        'technical_score': round(technical_score, 1),
+        'communication_score': round(communication_score, 1),
+        'confidence_score': round(confidence_score, 1),
+        'overall_score': overall_score,
+        'strengths': ['Completed the interview flow', 'Provided spoken responses for evaluation'],
+        'improvements': ['Add more technical depth', 'Use more structured explanations'],
+        'summary': 'Fallback scoring was used because automated analysis was unavailable.',
+    }
+
+
+def _parse_interview_analysis(response_text, context_entries):
+    try:
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if not json_match:
+            return _fallback_interview_scores(context_entries)
+
+        parsed = json.loads(json_match.group())
+        required_fields = ['technical_score', 'communication_score', 'confidence_score', 'overall_score']
+        for field in required_fields:
+            parsed[field] = max(0.0, min(100.0, float(parsed[field])))
+
+        parsed['strengths'] = parsed.get('strengths') or []
+        parsed['improvements'] = parsed.get('improvements') or []
+        parsed['summary'] = parsed.get('summary') or ''
+        return parsed
+    except Exception as exc:
+        logger.error(f"Failed to parse interview analysis response: {exc}")
+        return _fallback_interview_scores(context_entries)
+
+
+def _run_final_interview_analysis(interview_id):
+    close_old_connections()
+    try:
+        interview = Interview.objects.get(id=interview_id)
+        voice_session = VoiceInterviewSession.objects.filter(interview=interview).first()
+        context_entries = voice_session.interview_context if voice_session and isinstance(voice_session.interview_context, list) else []
+
+        if not context_entries:
+            logger.warning(f"Skipping interview analysis for {interview_id}: no interview context available")
+            interview.processing_status = 'failed'
+            interview.processing_error = 'No interview context available for analysis'
+            interview.save(update_fields=['processing_status', 'processing_error'])
+            return
+
+        interview.processing_status = 'processing'
+        interview.processing_started_at = timezone.now()
+        interview.processing_error = ''
+        interview.save(update_fields=['processing_status', 'processing_started_at', 'processing_error'])
+
+        scores = None
+        api_key = settings.OPENROUTER_CONFIG.get('API_KEY')
+        if api_key:
+            prompt = _build_interview_analysis_prompt(interview, context_entries)
+            response = HTTP_SESSION.post(
+                f"{settings.OPENROUTER_CONFIG['BASE_URL']}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": INTERVIEW_ANALYSIS_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 1200,
+                    "temperature": 0.2,
+                },
+                timeout=60,
+            )
+            if response.ok:
+                payload = response.json()
+                content = payload["choices"][0]["message"]["content"]
+                scores = _parse_interview_analysis(content, context_entries)
+            else:
+                logger.error(f"Interview analysis API failed: {response.status_code} - {response.text}")
+
+        if scores is None:
+            scores = _fallback_interview_scores(context_entries)
+
+        interview.technical_score = scores['technical_score']
+        interview.communication_score = scores['communication_score']
+        interview.confidence_score = scores['confidence_score']
+        interview.overall_score = scores['overall_score']
+        interview.analysis_completed = True
+        interview.processing_status = 'analysis_complete'
+        interview.processing_completed_at = timezone.now()
+        interview.save(update_fields=[
+            'technical_score',
+            'communication_score',
+            'confidence_score',
+            'overall_score',
+            'analysis_completed',
+            'processing_status',
+            'processing_completed_at',
+        ])
+
+        if voice_session:
+            session_data = voice_session.session_data or {}
+            session_data['analysis_summary'] = {
+                'strengths': scores.get('strengths', []),
+                'improvements': scores.get('improvements', []),
+                'summary': scores.get('summary', ''),
+                'scored_at': timezone.now().isoformat(),
+            }
+            voice_session.session_data = session_data
+            voice_session.save(update_fields=['session_data', 'updated_at'])
+
+        logger.info(f"Interview {interview_id} analyzed successfully with overall score {scores['overall_score']}")
+    except Exception as exc:
+        logger.error(f"Final interview analysis failed for {interview_id}: {exc}", exc_info=True)
+        try:
+            interview = Interview.objects.get(id=interview_id)
+            interview.processing_status = 'failed'
+            interview.processing_error = str(exc)
+            interview.save(update_fields=['processing_status', 'processing_error'])
+        except Exception:
+            logger.error(f"Could not persist failure state for interview {interview_id}")
+    finally:
+        close_old_connections()
 # Load environment variables
 load_dotenv()
 
@@ -1418,7 +1667,8 @@ def end_interview(request):
         interview.status = 'completed'
         interview.completed_at = timezone.now()
         interview.interview_duration_seconds = duration_seconds
-        interview.processing_status = 'pending'  # Ready for DAG processing
+        if not interview.analysis_completed:
+            interview.processing_status = 'pending'
         
         # Sync questions answered from voice session
         if voice_session:
@@ -1438,6 +1688,15 @@ def end_interview(request):
             interview.has_video_recording = frames_record.total_video_chunks > 0
             interview.has_frame_data = frames_record.total_frames > 0
             interview.save(update_fields=['has_video_recording', 'has_frame_data'])
+
+        if voice_session and voice_session.current_question_number >= interview.total_questions and not interview.analysis_completed:
+            interview.processing_status = 'processing'
+            interview.save(update_fields=['processing_status'])
+            threading.Thread(
+                target=_run_final_interview_analysis,
+                args=(interview.id,),
+                daemon=True,
+            ).start()
 
         # NEW: Create and store complete interview session JSON
         try:
@@ -2406,74 +2665,159 @@ def get_kafka_chunks_direct(request, session_id):
 
 # Add this class after your existing imports and before your existing classes
 class SpeechToText:
-    """Handles speech-to-text conversion using Gemini ONLY"""
+    """Handles speech-to-text conversion with local Whisper preferred."""
+
+    _model = None
+    _provider = None
+    _model_lock = threading.Lock()
 
     def __init__(self):
-        if not settings.GEMINI_API_KEY:
-            raise ValueError("Gemini STT requires GEMINI_API_KEY")
-
-        self.client = genai.Client(api_key=settings.GEMINI_API_KEY)
-        logger.info("✅ Gemini STT initialized")
+        self.config = getattr(settings, 'STT_CONFIG', {})
+        self.preferred_provider = self.config.get('PROVIDER', 'faster_whisper')
+        self.language = self.config.get('LANGUAGE', 'en')
+        self.client = genai.Client(api_key=settings.GEMINI_API_KEY) if settings.GEMINI_API_KEY else None
+        self._initialize_provider()
 
     def convert_audio_to_text(self, audio_data: bytes) -> str:
         try:
-            logger.info(f"Processing {len(audio_data)} bytes with Gemini STT")
+            logger.info(f"Processing {len(audio_data)} bytes with {self._provider} STT")
 
-            from google.genai import types
+            if self._provider == 'faster_whisper':
+                return self._convert_with_faster_whisper(audio_data)
 
-            response = self.client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[
-                    types.Part.from_bytes(
-                        data=audio_data,
-                        mime_type="audio/webm",
-                    ),
-                    "Transcribe this audio clearly. Return only the spoken words."
-                ],
+            if self._provider == 'whisper':
+                return self._convert_with_openai_whisper(audio_data)
+
+            return self._convert_with_gemini(audio_data)
+
+        except Exception as e:
+            logger.error(f"STT error using {self._provider}: {e}")
+            return None
+
+    def _initialize_provider(self):
+        with self._model_lock:
+            if self.__class__._provider is not None:
+                return
+
+            provider_order = [self.preferred_provider, 'whisper', 'gemini']
+            for provider in provider_order:
+                if provider == 'faster_whisper' and self._try_init_faster_whisper():
+                    return
+                if provider == 'whisper' and self._try_init_openai_whisper():
+                    return
+                if provider == 'gemini' and self.client:
+                    self.__class__._provider = 'gemini'
+                    logger.info("STT provider initialized: Gemini")
+                    return
+
+            raise ValueError("No STT provider is available. Install faster-whisper or configure Gemini.")
+
+    def _try_init_faster_whisper(self):
+        try:
+            from faster_whisper import WhisperModel
+
+            self.__class__._model = WhisperModel(
+                self.config.get('MODEL_SIZE', 'base.en'),
+                device=self.config.get('DEVICE', 'cpu'),
+                compute_type=self.config.get('COMPUTE_TYPE', 'int8'),
+                cpu_threads=self.config.get('CPU_THREADS', 4),
+                num_workers=self.config.get('NUM_WORKERS', 1),
             )
+            self.__class__._provider = 'faster_whisper'
+            logger.info(
+                "STT provider initialized: faster-whisper (%s, %s, %s)",
+                self.config.get('MODEL_SIZE', 'base.en'),
+                self.config.get('DEVICE', 'cpu'),
+                self.config.get('COMPUTE_TYPE', 'int8'),
+            )
+            return True
+        except Exception as exc:
+            logger.warning(f"faster-whisper unavailable: {exc}")
+            return False
 
-            transcription = response.text.strip() if response.text else None
-
-            if not transcription or len(transcription) < 2:
-                logger.warning("No clear speech detected")
-                return None
-
-            logger.info(f"✅ Gemini transcription: {transcription}")
-            return transcription
-
-        except Exception as e:
-            logger.error(f"Gemini STT error: {e}")
-            return None
-
-    def _convert_google_stt(self, audio_data: bytes) -> str:
-        """Convert using Google Speech Recognition as fallback"""
+    def _try_init_openai_whisper(self):
         try:
-            import speech_recognition as sr
-            audio = sr.AudioData(audio_data, 16000, 2)
-            text = self.recognizer.recognize_google(audio)
-            logger.info(f"Google STT result: '{text}'")
-            return text
-        except Exception as e:
-            logger.error(f"Google STT error: {e}")
-            return None
+            import whisper
 
-    def _try_fallback_stt(self, audio_data: bytes) -> str:
-        """Try fallback STT provider"""
+            self.__class__._model = whisper.load_model(self.config.get('MODEL_SIZE', 'base.en'))
+            self.__class__._provider = 'whisper'
+            logger.info("STT provider initialized: openai-whisper (%s)", self.config.get('MODEL_SIZE', 'base.en'))
+            return True
+        except Exception as exc:
+            logger.warning(f"openai-whisper unavailable: {exc}")
+            return False
+
+    def _convert_with_faster_whisper(self, audio_data: bytes) -> str:
+        audio_path = self._write_temp_audio_file(audio_data)
         try:
-            logger.info("Trying fallback Google STT...")
-            return self._convert_google_stt(audio_data)
-        except Exception as e:
-            logger.error(f"Fallback STT also failed: {e}")
+            segments, _info = self._model.transcribe(
+                audio_path,
+                language=self.language,
+                beam_size=1,
+                best_of=1,
+                condition_on_previous_text=False,
+                vad_filter=True,
+            )
+            transcription = " ".join(segment.text.strip() for segment in segments).strip()
+            if transcription:
+                logger.info(f"faster-whisper transcription: {transcription}")
+            return transcription or None
+        finally:
+            self._cleanup_temp_file(audio_path)
+
+    def _convert_with_openai_whisper(self, audio_data: bytes) -> str:
+        audio_path = self._write_temp_audio_file(audio_data)
+        try:
+            result = self._model.transcribe(
+                audio_path,
+                language=self.language,
+                fp16=False,
+                condition_on_previous_text=False,
+            )
+            transcription = (result.get('text') or '').strip()
+            if transcription:
+                logger.info(f"openai-whisper transcription: {transcription}")
+            return transcription or None
+        finally:
+            self._cleanup_temp_file(audio_path)
+
+    def _convert_with_gemini(self, audio_data: bytes) -> str:
+        if not self.client:
             return None
 
-    def _write_wav_file(self, filename: str, audio_data: bytes):
-        """Write audio data as WAV file"""
-        import wave
-        with wave.open(filename, 'wb') as wav_file:
-            wav_file.setnchannels(1)  # Mono
-            wav_file.setsampwidth(2)  # 16-bit
-            wav_file.setframerate(16000)  # 16kHz
-            wav_file.writeframes(audio_data)
+        from google.genai import types
+
+        response = self.client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                types.Part.from_bytes(
+                    data=audio_data,
+                    mime_type="audio/webm",
+                ),
+                "Transcribe this audio clearly. Return only the spoken words."
+            ],
+        )
+
+        transcription = response.text.strip() if response.text else None
+
+        if not transcription or len(transcription) < 2:
+            logger.warning("No clear speech detected")
+            return None
+
+        logger.info(f"Gemini transcription: {transcription}")
+        return transcription
+
+    def _write_temp_audio_file(self, audio_data: bytes):
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as temp_audio:
+            temp_audio.write(audio_data)
+            return temp_audio.name
+
+    def _cleanup_temp_file(self, path):
+        try:
+            if path and os.path.exists(path):
+                os.unlink(path)
+        except OSError as exc:
+            logger.warning(f"Failed to delete temp audio file {path}: {exc}")
 
 
 
@@ -2534,9 +2878,11 @@ class VoiceInterviewAgent:
     def process_voice_response_with_gemini(self, audio_file_path):
         """Process voice response using Gemini STT"""
         try:
-            # Read audio file as bytes
-            with open(audio_file_path, 'rb') as f:
-                audio_data = f.read()
+            if isinstance(audio_file_path, bytes):
+                audio_data = audio_file_path
+            else:
+                with open(audio_file_path, 'rb') as f:
+                    audio_data = f.read()
 
             # Use Gemini STT class for conversion
             transcription = self.stt.convert_audio_to_text(audio_data)
@@ -2563,25 +2909,17 @@ class VoiceInterviewAgent:
             }
 
     def text_to_speech_gtts(self, text, voice_style='default'):
-        """Convert text to speech with different voice options"""
+        """Convert text to speech with different voice options."""
         try:
-            logger.info(f"Generating TTS for: '{text}' with voice: {voice_style}")
+            _ensure_directory(TTS_CACHE_DIR)
+            cache_key = hashlib.sha256(f"{voice_style}:{text}".encode('utf-8')).hexdigest()
+            cache_path = os.path.join(TTS_CACHE_DIR, f"{cache_key}.mp3")
 
-            # Use Gemini to optimize text for speech
-            try:
-                model = genai.GenerativeModel('models/gemini-1.5-pro-latest')
-                tts_prompt = f"""
-                Optimize this interview question text for clear speech synthesis. Make it natural and well-paced:
-                "{text}"
+            if os.path.exists(cache_path):
+                with open(cache_path, 'rb') as cached_audio:
+                    return base64.b64encode(cached_audio.read()).decode('utf-8')
 
-                Return only the optimized text, nothing else.
-                """
-                response = model.generate_content(tts_prompt)
-                optimized_text = response.text.strip()
-                logger.info(f"Gemini optimized text: '{optimized_text}'")
-            except Exception as e:
-                logger.warning(f"Gemini optimization failed: {e}, using original text")
-                optimized_text = text
+            logger.info(f"Generating TTS for question with voice: {voice_style}")
 
             # Generate audio using gTTS with different voice options
             from gtts import gTTS
@@ -2597,18 +2935,17 @@ class VoiceInterviewAgent:
 
             config = voice_configs.get(voice_style, voice_configs['default'])
 
-            tts = gTTS(text=optimized_text, **config)
+            tts = gTTS(text=text, **config)
+            audio_buffer = io.BytesIO()
+            tts.write_to_fp(audio_buffer)
+            audio_content = audio_buffer.getvalue()
 
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as temp_file:
-                tts.save(temp_file.name)
+            with open(cache_path, 'wb') as cached_audio:
+                cached_audio.write(audio_content)
 
-                with open(temp_file.name, 'rb') as audio_file:
-                    audio_content = audio_file.read()
-                    audio_base64 = base64.b64encode(audio_content).decode('utf-8')
-
-                os.unlink(temp_file.name)
-                logger.info(f"TTS generated successfully with {voice_style} voice, {len(audio_base64)} chars base64")
-                return audio_base64
+            audio_base64 = base64.b64encode(audio_content).decode('utf-8')
+            logger.info(f"TTS generated successfully with {voice_style} voice")
+            return audio_base64
 
         except Exception as e:
             logger.error(f"TTS error: {e}")
@@ -2672,7 +3009,7 @@ class VoiceInterviewAgent:
             "top_p": 0.9
         }
 
-        response = requests.post(
+        response = HTTP_SESSION.post(
             f"{self.base_url}/chat/completions",
             headers=headers,
             json=data,
@@ -2787,7 +3124,7 @@ def start_voice_interview(request):
         # 🔥 GENERATE TTS FOR FIRST QUESTION
         # =========================
         agent = VoiceInterviewAgent()
-        audio_base64 = agent.text_to_speech_gtts(question_obj.question_text)
+        audio_payload = _build_question_audio_payload(agent, question_obj.question_text)
 
         return JsonResponse({
             'success': True,
@@ -2797,8 +3134,8 @@ def start_voice_interview(request):
             'stage': voice_session.current_stage,
             'session_id': voice_session.id,
             'total_questions': interview.total_questions,
-            'has_audio': audio_base64 is not None,
-            'audio_base64': audio_base64,
+            'has_audio': audio_payload['has_audio'],
+            'audio_base64': audio_payload['audio_base64'],
         })
 
     except Exception as e:
@@ -2854,7 +3191,7 @@ def start_voice_interview(request):
 @csrf_exempt
 @require_http_methods(["POST"])
 def process_voice_response(request):
-    """Process voice response using Gemini STT and fetch next question from CSV with TTS"""
+    """Process voice response with low-latency local persistence and cached TTS."""
 
     try:
         if not request.user.is_authenticated:
@@ -2876,139 +3213,97 @@ def process_voice_response(request):
         if not voice_session:
             return JsonResponse({'error': 'Voice session not found'}, status=404)
 
-        # =========================
-        # SAVE TEMP AUDIO
-        # =========================
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as temp_file:
-            for chunk in audio_file.chunks():
-                temp_file.write(chunk)
-            temp_audio_path = temp_file.name
+        audio_bytes = b''.join(audio_file.chunks())
+        agent = VoiceInterviewAgent()
+
+        stt_result = agent.process_voice_response_with_gemini(audio_bytes)
+        if not stt_result['success']:
+            return JsonResponse({
+                'success': False,
+                'error': stt_result['error']
+            })
+
+        transcription = stt_result['transcription']
+        current_question_number = voice_session.current_question_number
+        current_question_id = voice_session.session_data.get('current_question_id')
+
+        if not current_question_id:
+            return JsonResponse({'success': False, 'error': 'Current question is missing from session'}, status=400)
 
         try:
-            # =========================
-            # GEMINI STT
-            # =========================
-            agent = VoiceInterviewAgent()
-            stt_result = agent.process_voice_response_with_gemini(temp_audio_path)
+            current_question = Question.objects.get(id=current_question_id)
+        except Question.DoesNotExist:
+            return JsonResponse({'success': False, 'error': 'Current question no longer exists'}, status=404)
 
-            if not stt_result['success']:
-                return JsonResponse({
-                    'success': False,
-                    'error': stt_result['error']
-                })
+        local_audio_path = _save_audio_locally(interview, current_question_number, audio_bytes)
+        response_record = InterviewResponse.objects.create(
+            interview=interview,
+            question=current_question,
+            audio_file_path=local_audio_path,
+            local_file_path=local_audio_path
+        )
+        _append_interview_context(voice_session, current_question, transcription)
 
-            transcription = stt_result['transcription']
-            current_question_number = voice_session.current_question_number
+        threading.Thread(
+            target=_upload_audio_to_hdfs_in_background,
+            args=(response_record.id, interview.id, current_question_number, local_audio_path),
+            daemon=True,
+        ).start()
 
-            # =========================
-            # SAVE AUDIO TO HDFS
-            # =========================
-            hdfs_audio_path = None
-            audio_saved = False
+        voice_session.record_question_answered(audio_saved=True)
 
-            try:
-                hdfs_client = HDFSClient()
-                if hdfs_client.is_connected():
-                    with open(temp_audio_path, 'rb') as f:
-                        audio_content = f.read()
+        if current_question_number >= interview.total_questions:
+            voice_session.complete_session(reason='completed')
 
-                    hdfs_audio_path = (
-                        f"/student_audio_responses/"
-                        f"interview_{interview.id}/"
-                        f"question_{current_question_number}.webm"
-                    )
+            interview.voice_interview_completed = True
+            interview.completion_reason = 'all_questions_answered'
+            interview.questions_answered = interview.total_questions
+            interview.completion_percentage = 100
+            interview.processing_status = 'processing'
+            interview.save()
 
-                    success = hdfs_client.write_file(hdfs_audio_path, audio_content)
-
-                    if success:
-                        audio_saved = True
-
-            except Exception as e:
-                logger.error(f"HDFS save failed: {e}")
-
-            # =========================
-            # STORE RESPONSE RECORD
-            # =========================
-            question_id = voice_session.session_data.get('current_question_id')
-
-            if audio_saved and question_id:
-                try:
-                    question_obj = Question.objects.get(id=question_id)
-
-                    InterviewResponse.objects.create(
-                        interview=interview,
-                        question=question_obj,
-                        audio_file_path=hdfs_audio_path,
-                        local_file_path=None
-                    )
-
-                except Question.DoesNotExist:
-                    logger.error("Question not found while saving response")
-
-            # Update progress
-            voice_session.record_question_answered(audio_saved=audio_saved)
-
-            # =========================
-            # CHECK IF INTERVIEW COMPLETE
-            # =========================
-            if current_question_number >= interview.total_questions:
-                voice_session.complete_session(reason='completed')
-
-                interview.voice_interview_completed = True
-                interview.completion_reason = 'all_questions_answered'
-                interview.questions_answered = interview.total_questions
-                interview.completion_percentage = 100
-                interview.save()
-
-                return JsonResponse({
-                    'success': True,
-                    'interview_complete': True,
-                    'transcription': transcription
-                })
-
-            # =========================
-            # FETCH NEXT QUESTION FROM CSV
-            # =========================
-            next_question_number = current_question_number + 1
-
-            question_obj = get_random_question(interview)
-
-            if not question_obj:
-                return JsonResponse({
-                    'success': False,
-                    'error': 'No more questions available'
-                })
-
-            # Update session with new question
-            voice_session.current_question_number = next_question_number
-            voice_session.current_stage = 'technical'
-            voice_session.session_data['current_question'] = question_obj.question_text
-            voice_session.session_data['current_question_id'] = str(question_obj.id)
-            voice_session.save()
-
-            # =========================
-            # 🔥 GENERATE TTS AUDIO FOR NEXT QUESTION
-            # =========================
-            agent = VoiceInterviewAgent()
-            audio_base64 = agent.text_to_speech_gtts(question_obj.question_text)
+            threading.Thread(
+                target=_run_final_interview_analysis,
+                args=(interview.id,),
+                daemon=True,
+            ).start()
 
             return JsonResponse({
                 'success': True,
-                'transcription': transcription,
-                'next_question': question_obj.question_text,
-                'question_id': str(question_obj.id),
-                'question_number': next_question_number,
-                'progress_percentage': int(
-                    (next_question_number / interview.total_questions) * 100
-                ),
-                'interview_complete': False,
-                'audio_base64': audio_base64,
-                'has_audio': audio_base64 is not None
+                'interview_complete': True,
+                'transcription': transcription
             })
 
-        finally:
-            if os.path.exists(temp_audio_path):
-                os.unlink(temp_audio_path)
+        next_question_number = current_question_number + 1
+        question_obj = get_random_question(interview, excluded_question_ids={current_question.id})
+
+        if not question_obj:
+            return JsonResponse({
+                'success': False,
+                'error': 'No more questions available'
+            })
+
+        voice_session.current_question_number = next_question_number
+        voice_session.current_stage = 'technical'
+        voice_session.session_data['current_question'] = question_obj.question_text
+        voice_session.session_data['current_question_id'] = str(question_obj.id)
+        voice_session.save()
+
+        audio_payload = _build_question_audio_payload(agent, question_obj.question_text)
+
+        return JsonResponse({
+            'success': True,
+            'transcription': transcription,
+            'next_question': question_obj.question_text,
+            'question_id': str(question_obj.id),
+            'question_number': next_question_number,
+            'progress_percentage': int(
+                (next_question_number / interview.total_questions) * 100
+            ),
+            'interview_complete': False,
+            'audio_base64': audio_payload['audio_base64'],
+            'has_audio': audio_payload['has_audio']
+        })
 
     except Exception as e:
         logger.error(f"Error processing voice response: {e}", exc_info=True)
@@ -3122,6 +3417,10 @@ def download_student_report(request, interview_id):
     doc = SimpleDocTemplate(response, pagesize=A4)
     elements = []
     styles = getSampleStyleSheet()
+    voice_session = VoiceInterviewSession.objects.filter(interview=interview).first()
+    analysis_summary = {}
+    if voice_session and isinstance(voice_session.session_data, dict):
+        analysis_summary = voice_session.session_data.get('analysis_summary', {})
 
     # Title
     title_style = styles['Heading1']
@@ -3152,10 +3451,10 @@ def download_student_report(request, interview_id):
     elements.append(Paragraph("<b>You Are Best At:</b>", styles['Heading3']))
     elements.append(Spacer(1, 10))
 
-    best_points = [
-        "Strong Technical Fundamentals",
-        "Excellent Communication Skills",
-        "Confident Interview Presence"
+    best_points = analysis_summary.get('strengths') or [
+        "Technical score available after interview analysis",
+        "Communication score available after interview analysis",
+        "Confidence score available after interview analysis"
     ]
 
     elements.append(ListFlowable(
@@ -3169,10 +3468,10 @@ def download_student_report(request, interview_id):
     elements.append(Paragraph("<b>Needs Improvement:</b>", styles['Heading3']))
     elements.append(Spacer(1, 10))
 
-    improve_points = [
-        "Needs More Advanced Coding Practice",
-        "Improve Time Management",
-        "Work on Analytical Depth"
+    improve_points = analysis_summary.get('improvements') or [
+        "Awaiting automated improvement suggestions",
+        "Awaiting automated improvement suggestions",
+        "Awaiting automated improvement suggestions"
     ]
 
     elements.append(ListFlowable(
@@ -3188,10 +3487,10 @@ def download_student_report(request, interview_id):
 
     score_data = [
         ['Section', 'Score'],
-        ['Technical Skills', f'{interview.technical_score or 0} / 10'],
-        ['Communication Skills', f'{interview.communication_score or 0} / 10'],
-        ['Confidence', f'{interview.confidence_score or 0} / 10'],
-        ['Overall Score', f'{interview.overall_score or 0} / 10'],
+        ['Technical Skills', f'{interview.technical_score or 0:.1f} / 100'],
+        ['Communication Skills', f'{interview.communication_score or 0:.1f} / 100'],
+        ['Confidence', f'{interview.confidence_score or 0:.1f} / 100'],
+        ['Overall Score', f'{interview.overall_score or 0:.1f} / 100'],
     ]
 
     score_table = Table(score_data, colWidths=[250, 150])
@@ -3204,6 +3503,12 @@ def download_student_report(request, interview_id):
 
     elements.append(score_table)
     elements.append(Spacer(1, 40))
+
+    if analysis_summary.get('summary'):
+        elements.append(Paragraph("<b>Evaluator Summary:</b>", styles['Heading3']))
+        elements.append(Spacer(1, 10))
+        elements.append(Paragraph(analysis_summary['summary'], styles['Normal']))
+        elements.append(Spacer(1, 20))
 
     elements.append(Paragraph("Thank You", styles['Normal']))
 

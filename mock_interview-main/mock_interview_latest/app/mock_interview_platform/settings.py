@@ -136,6 +136,18 @@ OPENROUTER_CONFIG = {
 
 GEMINI_API_KEY = env('GEMINI_API_KEY', default='')
 
+STT_CONFIG = {
+    'PROVIDER': env('STT_PROVIDER', default='faster_whisper'),
+    'MODEL_SIZE': env('WHISPER_MODEL_SIZE', default='tiny.en'),
+    'DEVICE': env('WHISPER_DEVICE', default='cpu'),
+    'COMPUTE_TYPE': env('WHISPER_COMPUTE_TYPE', default='int8'),
+    'CPU_THREADS': env.int('WHISPER_CPU_THREADS', default=4),
+    'NUM_WORKERS': env.int('WHISPER_NUM_WORKERS', default=1),
+    'LANGUAGE': env('WHISPER_LANGUAGE', default='en'),
+}
+
+VOICE_INTERVIEW_TTS_ENABLED = env.bool('VOICE_INTERVIEW_TTS_ENABLED', default=True)
+
 if not GEMINI_API_KEY:
     print("⚠️ WARNING: GEMINI_API_KEY is not set in .env file")
 else:

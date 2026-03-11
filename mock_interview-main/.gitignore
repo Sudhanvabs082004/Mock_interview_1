@@ -2,14 +2,15 @@
 # Mock Interview Platform - .gitignore
 # ============================================
 
-# ==================== Python ====================
+# ================= Python =================
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+
+# Build / packaging
 build/
-develop-eggs/
 dist/
 downloads/
 eggs/
@@ -24,70 +25,53 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual Environments
+# ================= Virtual Environments =================
 env/
 venv/
 ENV/
 .venv/
-mock_interview_audio_api/app/env/
+venv311/
+**/venv/
+**/venv311/
 
-# ==================== Environment & Secrets ====================
+# ================= Environment & Secrets =================
 .env
 .env.local
-.env.*.local
+.env.*
 *.env
 .envrc
 
-# API Keys (never commit these!)
+# ================= API Keys =================
 **/secrets.py
 **/credentials.py
 
-# ==================== Django ====================
+# ================= Django =================
 *.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
 staticfiles/
 media/
-*.pot
-*.mo
 
-# ==================== Docker ====================
-.dockerenv
-.docker/
-*.tar
+# ================= Certificates / SSL =================
+*.crt
+*.key
+selfsigned.*
+cert.*
 
-# ==================== IDE & Editors ====================
+# ================= IDE =================
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-.project
-.pydevproject
-.settings/
-*.sublime-project
-*.sublime-workspace
 
-# ==================== Generated Analysis Files ====================
-# Dlib container analysis outputs (regenerated on each interview)
-dlib_video/interview_results/*.json
-dlib_video/COMBINED_*.json
-dlib_video/logs/
-dlib_video/open_cv/*.dat
-
-# Audio API outputs
-mock_interview_audio_api/app/output/
-mock_interview_audio_api/app/audio/
-mock_interview_audio_api/app/*.json
-
-# ==================== Log Files ====================
-*.log
+# ================= Logs =================
 logs/
+*.log
 *.log.*
-interview.log
 
-# ==================== Temporary Files ====================
+# ================= Temporary =================
 *.tmp
 *.temp
 *.bak
@@ -99,59 +83,22 @@ htmlcov/
 .tox/
 .nox/
 
-# ==================== OS Generated ====================
+# ================= OS Files =================
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
 desktop.ini
 
-# ==================== Jupyter Notebooks ====================
+# ================= Jupyter =================
 .ipynb_checkpoints/
 *.ipynb
 
-# ==================== Documentation Outputs ====================
-# Documentation generator scripts and outputs
-Mock_Interview_Platform_Documentation.docx
-mock_interview_flow.drawio.xml
-generate_documentation.py
-generate_complete_documentation.py
+# ================= Generated Interview Data =================
+mock_interview_latest/app/interview_sessions/*.json
+dlib_video/interview_results/*.json
+dlib_video/logs/
+dlib_video/COMBINED_*.json
 
-# ==================== Archived Data (Optional) ====================
-# Uncomment if you don't want to track archived old audio responses
-# mock_interview_latest/app/_archived/old_data/audio_responses/
-
-# ==================== Node (if any frontend tooling) ====================
-node_modules/
-npm-debug.log
-yarn-error.log
-
-# ==================== Compiled Files ====================
-*.com
-*.class
-*.dll
-*.exe
-*.o
-*.so
-
-# ==================== Test & Coverage ====================
-.coverage
-.pytest_cache/
-nosetests.xml
-coverage.xml
-*.cover
-.hypothesis/
-
-# ==================== mypy ====================
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# ==================== Audio/Video Files ====================
-# Audio files (interview recordings)
+# ================= Audio =================
 *.webm
 *.wav
 *.mp3
@@ -159,38 +106,42 @@ dmypy.json
 *.flac
 *.aac
 *.m4a
-*.wma
 
+**/audio/
+**/recordings/
+**/audio_responses/
 
-
-# Video files
+# ================= Video =================
 *.mp4
 *.avi
 *.mov
 *.mkv
-*.wmv
-*.flv
 
-# Audio responses directories
-**/audio_responses/
-**/audio/
-**/recordings/
-
-# ==================== Large Binary Files ====================
-# Dlib model files
+# ================= ML Models =================
 *.dat
 *.pkl
 *.h5
 *.model
 
-# Compressed archives
-*.tar.gz
-*.tar.bz2
-*.tar.xz
-*.tgz
+# ================= Node =================
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# ================= Archives =================
 *.zip
 *.rar
 *.7z
+*.tar
+*.tar.gz
+*.tar.xz
 
+# ================= Accidental Nested Projects =================
+mock_interview_latest/mock_interview-main/
+mock_interview_latest/app/app/
 
-
+# ================= Binary =================
+*.exe
+*.dll
+*.o
+*.class
