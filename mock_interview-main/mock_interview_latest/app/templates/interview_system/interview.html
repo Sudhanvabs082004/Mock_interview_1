@@ -823,12 +823,12 @@
             this.audioContext = null;
             this.analyser = null;
             this.dataArray = null;
-            this.silenceThreshold = 1800;
+            this.silenceThreshold = 900;
             this.silenceTimer = null;
             this.speechDetected = false;
             this.lastSpeechTime = null;
             this.currentAudio = null;
-            this.maxRecordingTime = 20000;
+            this.maxRecordingTime = 15000;
             this.speechThresholdLevel = 0.02;
             this.recordingStartTime = null;
             this.backgroundNoiseLevel = 0;
@@ -1079,6 +1079,13 @@
             }
         }
 
+        async presentQuestionAudio(question, audioBase64 = null) {
+            const browserTtsWorked = await this.speakQuestion(question);
+            if (!browserTtsWorked && audioBase64) {
+                await this.playAIAudio(audioBase64);
+            }
+        }
+
 
         async startInterview() {
             try {
@@ -1104,23 +1111,12 @@
                     this.updateProgressDisplay();
                     this.addToConversation('ai', result.question, result.question_number);
 
-                    // Play first question audio if available
-                    if (result.has_audio && result.audio_base64) {
-                        console.log('Playing first question audio...');
-                        await this.playAIAudio(result.audio_base64);
+                    await this.presentQuestionAudio(result.question, result.audio_base64);
 
-                        setTimeout(() => {
-                            this.updateLiveTranscript('Your response...');
-                            this.startListening();
-                        }, 250);
-                    } else {
-                        await this.speakQuestion(result.question);
-
-                        setTimeout(() => {
-                            this.updateLiveTranscript('Your response...');
-                            this.startListening();
-                        }, 250);
-                    }
+                    setTimeout(() => {
+                        this.updateLiveTranscript('Your response...');
+                        this.startListening();
+                    }, 250);
 
                     return true;
                 } else {
@@ -1164,7 +1160,7 @@
                     this.updateVoiceResponseCounter();
 
                     if (result.interview_complete) {
-                        this.completeInterview(result.message);
+                        await this.completeInterview(result.message || 'Interview over.', result.redirect_url || '/');
                     } else {
 
                         // 🔥 FIXED: Use next_question instead of question
@@ -1176,13 +1172,7 @@
                         this.updateProgressDisplay();
                         this.addToConversation('ai', result.next_question, result.question_number);
 
-                        // 🔥 Play AI generated audio if available
-                        if (result.has_audio && result.audio_base64) {
-                            console.log("Playing next AI audio...");
-                            await this.playAIAudio(result.audio_base64);
-                        } else {
-                            await this.speakQuestion(result.next_question);
-                        }
+                        await this.presentQuestionAudio(result.next_question, result.audio_base64);
 
                         setTimeout(() => this.startListening(), 250);
                     }
@@ -1203,7 +1193,7 @@
         async speakQuestion(question) {
             return new Promise(async (resolve) => {
                 if (!this.speechSynthesis) {
-                    resolve();
+                    resolve(false);
                     return;
                 }
 
@@ -1235,7 +1225,16 @@
                         this.pendingSpeechTimeout = null;
                     }
                     this.updateAIStatus('ready', 'Ready for your response');
-                    resolve();
+                    resolve(true);
+                };
+
+                const failSpeech = () => {
+                    if (this.pendingSpeechTimeout) {
+                        clearTimeout(this.pendingSpeechTimeout);
+                        this.pendingSpeechTimeout = null;
+                    }
+                    this.updateAIStatus('ready', 'Ready for your response');
+                    resolve(false);
                 };
 
                 utterance.onstart = () => {
@@ -1244,13 +1243,13 @@
                 utterance.onend = () => finishSpeech();
                 utterance.onerror = (error) => {
                     console.error('TTS error:', error);
-                    finishSpeech();
+                    failSpeech();
                 };
 
                 this.pendingSpeechTimeout = setTimeout(() => {
                     console.warn('Browser TTS timed out, continuing');
                     this.speechSynthesis.cancel();
-                    finishSpeech();
+                    failSpeech();
                 }, Math.max(3000, question.length * 90));
 
                 this.speechSynthesis.speak(utterance);
@@ -1373,7 +1372,7 @@
                     }
 
                     if (result.interview_complete) {
-                        this.completeInterview(result.message || 'Interview completed!');
+                        await this.completeInterview(result.message || 'Interview over.', result.redirect_url || '/');
                     } else if (result.next_question) {
                         // Update for next question
                         this.currentQuestion = result.next_question;
@@ -1384,21 +1383,15 @@
                         this.updateProgressDisplay();
                         this.addToConversation('ai', result.next_question, result.question_number);
 
-                        // IMPORTANT: Play audio BEFORE starting next listening
-                        if (result.has_audio && (result.audio_base64 || result.next_audio_base64)) {
-                            console.log('Playing AI audio...');
-                            await this.playAIAudio(result.audio_base64 || result.next_audio_base64);
+                        await this.presentQuestionAudio(
+                            result.next_question,
+                            result.audio_base64 || result.next_audio_base64
+                        );
 
-                            setTimeout(() => {
-                                this.updateLiveTranscript('Your response...');
-                                this.startListening();
-                            }, 250);
-                        } else {
-                            setTimeout(() => {
-                                this.updateLiveTranscript('Your response...');
-                                this.startListening();
-                            }, 250);
-                        }
+                        setTimeout(() => {
+                            this.updateLiveTranscript('Your response...');
+                            this.startListening();
+                        }, 250);
                     } else {
                         throw new Error(result.error || 'Processing failed');
                     }
@@ -1490,15 +1483,29 @@ async startListening() {
                 }
             }
 
-            completeInterview(message) {
+            async completeInterview(message, redirectUrl = '/') {
                 this.isActive = false;
                 this.addToConversation('ai', message, this.questionNumber + 1);
                 this.updateAIStatus('completed', 'Interview completed!');
 
-                setTimeout(() => {
-                    alert('Interview completed! Thank you for your time.');
-                    document.getElementById('endInterviewBtn').click();
-                }, 2000);
+                try {
+                    frontendProctoring.stop();
+                    proctoringActive = false;
+                    await stopKafkaStreaming();
+                } catch (error) {
+                    console.error('Error stopping interview media during completion:', error);
+                }
+
+                if (document.exitFullscreen) {
+                    try {
+                        await document.exitFullscreen();
+                    } catch (error) {
+                        console.warn('Failed to exit fullscreen:', error);
+                    }
+                }
+
+                alert(message || 'Interview over.');
+                window.location.replace(redirectUrl || '/');
             }
 
             startSilenceDetection() {
@@ -1530,7 +1537,7 @@ async startListening() {
                     const currentTime = Date.now();
                     const recordingDuration = (currentTime - this.recordingStartTime) / 1000;
 
-                    if (recordingDuration < 0.6 && !this.speechDetected) {
+                    if (recordingDuration < 0.35 && !this.speechDetected) {
                         backgroundNoiseLevel = Math.max(backgroundNoiseLevel, averageLevel);
                         adaptiveThreshold = backgroundNoiseLevel + 18;
                         console.log(`📊 Calibrating: Background=${backgroundNoiseLevel.toFixed(1)}, Threshold=${adaptiveThreshold.toFixed(1)}`);
@@ -1566,9 +1573,9 @@ async startListening() {
 
                         // More intelligent stopping logic - need both time and confidence
                         if (!this.silenceTimer &&
-                            speechConfidence > 3 &&
-                            silenceDuration > 0.45 &&
-                            consecutiveSilenceCount > 4) {
+                            speechConfidence > 2 &&
+                            silenceDuration > 0.25 &&
+                            consecutiveSilenceCount > 2) {
 
                             console.log('🔇 Starting silence timer... Confidence:', speechConfidence, 'Duration:', silenceDuration.toFixed(1));
                             this.updateVoiceStatus('silence', `Natural pause detected... Will stop in ${this.silenceThreshold / 1000} seconds`);
@@ -1579,7 +1586,7 @@ async startListening() {
                             }, this.silenceThreshold);
                         }
 
-                        if (silenceDuration > 4.0) {
+                        if (silenceDuration > 2.0) {
                             console.log('⏰ Extended silence - force stopping');
                             this.stopListening();
                             return;
@@ -1718,6 +1725,8 @@ class KafkaVideoStreamer {
             this.totalChunks = 0;
             this.recordingStartTime = null;
             this.videoSessionId = null;
+            this.stopPromise = null;
+            this.recordedChunks = [];
         }
 
         async startVideoStreaming(stream, interviewId, providedVideoSessionId = null) {
@@ -1757,9 +1766,11 @@ class KafkaVideoStreamer {
                 this.chunkCounter = 0;
                 this.totalChunks = 0;
                 this.recordingStartTime = Date.now();
+                this.recordedChunks = [];
 
                 this.videoRecorder.ondataavailable = async (event) => {
                     if (event.data && event.data.size > 0) {
+                        this.recordedChunks.push(event.data);
                         if (event.data.size < 1000 || event.data.size > 2 * 1024 * 1024) {
                             return;
                         }
@@ -1772,8 +1783,14 @@ class KafkaVideoStreamer {
                     }
                 };
 
-                this.videoRecorder.onstop = () => {
-                    this.finalizeVideoSession(interviewId);
+                this.videoRecorder.onstop = async () => {
+                    try {
+                        await this.uploadCompleteVideo(interviewId);
+                        await this.finalizeVideoSession(interviewId);
+                    } finally {
+                        this.isRecording = false;
+                        this.stopPromise = null;
+                    }
                 };
 
                 this.videoRecorder.onerror = (event) => {
@@ -1870,11 +1887,66 @@ class KafkaVideoStreamer {
             }
         }
 
-        stopVideoStreaming() {
-            if (this.videoRecorder && this.isRecording) {
-                this.videoRecorder.stop();
-                this.isRecording = false;
+        async uploadCompleteVideo(interviewId) {
+            try {
+                if (!this.recordedChunks.length) {
+                    console.warn('No recorded video chunks available for final upload');
+                    return false;
+                }
+
+                const mimeType = this.videoRecorder?.mimeType || 'video/webm';
+                const videoBlob = new Blob(this.recordedChunks, { type: mimeType });
+                const formData = new FormData();
+                formData.append('video', videoBlob, `interview_${interviewId}.webm`);
+                formData.append('interview_id', String(interviewId));
+
+                const response = await fetch('/interview/api/save-video/', {
+                    method: 'POST',
+                    body: formData,
+                    headers: {
+                        'X-CSRFToken': getCookie('csrftoken')
+                    }
+                });
+
+                if (!response.ok) {
+                    console.error('Final video upload failed with status', response.status);
+                    return false;
+                }
+
+                const result = await response.json();
+                console.log('Final video upload result:', result);
+                return !!result.success;
+            } catch (error) {
+                console.error('Error uploading final video:', error);
+                return false;
             }
+        }
+
+        async stopVideoStreaming() {
+            if (!this.videoRecorder || !this.isRecording) {
+                return;
+            }
+
+            if (typeof this.videoRecorder.requestData === 'function' && this.videoRecorder.state === 'recording') {
+                try {
+                    this.videoRecorder.requestData();
+                } catch (error) {
+                    console.warn('Error requesting final video data:', error);
+                }
+            }
+
+            this.stopPromise = new Promise((resolve) => {
+                const previousOnStop = this.videoRecorder.onstop;
+                this.videoRecorder.onstop = async (...args) => {
+                    if (typeof previousOnStop === 'function') {
+                        await previousOnStop.apply(this.videoRecorder, args);
+                    }
+                    resolve();
+                };
+            });
+
+            this.videoRecorder.stop();
+            await this.stopPromise;
         }
 
         updateVideoChunkStatus() {
@@ -2139,7 +2211,6 @@ class KafkaVideoStreamer {
     // REPLACE your getSessionIds function with this:
     async function getSessionIds() {
         try {
-            // Don't try to start interview again - just get current status
             const response = await fetch('/interview/api/current/', {
                 method: 'GET',
                 headers: {
@@ -2150,11 +2221,10 @@ class KafkaVideoStreamer {
 
             if (response.ok) {
                 const result = await response.json();
-                if (result.success) {
-                    // Mock session IDs since interview is already started
+                if (result.success && (result.frame_session_id || result.video_session_id)) {
                     return {
-                        frame_session_id: `frame_${result.interview_id}_${Date.now()}`,
-                        video_session_id: `video_${result.interview_id}_${Date.now()}`
+                        frame_session_id: result.frame_session_id,
+                        video_session_id: result.video_session_id
                     };
                 }
             }
@@ -2259,6 +2329,78 @@ class KafkaVideoStreamer {
         }
     }
 
+    let interviewEnding = false;
+
+    async function endInterviewFlow(skipConfirm = false, showCompletionAlert = false) {
+        if (interviewEnding) {
+            return;
+        }
+
+        if (!skipConfirm && !confirm('Are you sure you want to end the interview? This action cannot be undone.')) {
+            return;
+        }
+
+        interviewEnding = true;
+
+        try {
+            voiceInterviewManager.isActive = false;
+            frontendProctoring.stop();
+            proctoringActive = false;
+
+            await stopKafkaStreaming();
+
+            const response = await fetch('/interview/api/end/', {
+                method: 'POST',
+                headers: {
+                    'X-CSRFToken': getCookie('csrftoken'),
+                    'Content-Type': 'application/json'
+                }
+            });
+
+            const result = await response.json();
+
+            if (response.ok && result.success) {
+                if (document.exitFullscreen) {
+                    document.exitFullscreen().catch(() => { });
+                }
+
+                if (showCompletionAlert) {
+                    alert('Interview over.');
+                    const redirectUrl = result.redirect_url || '/';
+                    window.location.replace(redirectUrl);
+                    return;
+                }
+
+                const processingModal = document.createElement('div');
+                processingModal.className = 'fixed inset-0 bg-black bg-opacity-95 z-50 flex items-center justify-center';
+                processingModal.innerHTML = `
+                    <div class="bg-gray-800 p-8 rounded-lg max-w-md text-center border-2 border-blue-500">
+                        <div class="text-blue-500 mb-6">
+                            <i class="fas fa-check-circle text-5xl"></i>
+                        </div>
+                        <h2 class="text-2xl font-bold text-white mb-4">Interview Completed!</h2>
+                        <p class="text-gray-300 mb-4">Your responses have been recorded.</p>
+                        <div class="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500 mx-auto"></div>
+                    </div>
+                `;
+
+                document.body.appendChild(processingModal);
+
+                setTimeout(() => {
+                    const redirectUrl = result.redirect_url || '/';
+                    window.location.replace(redirectUrl);
+                }, 2000);
+                return;
+            }
+
+            throw new Error(result.error || 'Failed to end interview');
+        } catch (error) {
+            console.error('Error ending interview:', error);
+            alert('Error ending interview: ' + error.message);
+            interviewEnding = false;
+        }
+    }
+
     function setupEnhancedControls() {
         document.getElementById('returnToInterviewBtn').onclick = () => {
             document.getElementById('proctoringModal').style.display = 'none';
@@ -2280,55 +2422,7 @@ class KafkaVideoStreamer {
         };
 
         document.getElementById('endInterviewBtn').onclick = async function () {
-            if (confirm('Are you sure you want to end the interview? This action cannot be undone.')) {
-                try {
-                    voiceInterviewManager.isActive = false;
-                    frontendProctoring.stop();
-                    proctoringActive = false;
-
-                    stopKafkaStreaming();
-
-                    const response = await fetch('/interview/api/end/', {
-                        method: 'POST',
-                        headers: {
-                            'X-CSRFToken': getCookie('csrftoken'),
-                            'Content-Type': 'application/json'
-                        }
-                    });
-
-                    const result = await response.json();
-
-                    if (response.ok && result.success) {
-                        const processingModal = document.createElement('div');
-                        processingModal.className = 'fixed inset-0 bg-black bg-opacity-95 z-50 flex items-center justify-center';
-                        processingModal.innerHTML = `
-                        <div class="bg-gray-800 p-8 rounded-lg max-w-md text-center border-2 border-blue-500">
-                            <div class="text-blue-500 mb-6">
-                                <i class="fas fa-check-circle text-5xl"></i>
-                            </div>
-                            <h2 class="text-2xl font-bold text-white mb-4">Interview Completed!</h2>
-                            <p class="text-gray-300 mb-4">Your responses have been recorded.</p>
-                            <div class="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500 mx-auto"></div>
-                        </div>
-                    `;
-
-                        document.body.appendChild(processingModal);
-
-                        if (document.exitFullscreen) {
-                            document.exitFullscreen().catch(() => { });
-                        }
-
-                        setTimeout(() => {
-                            window.location.href = '/';
-                        }, 2000);
-                    } else {
-                        throw new Error(result.error || 'Failed to end interview');
-                    }
-                } catch (error) {
-                    console.error('Error ending interview:', error);
-                    alert('Error ending interview: ' + error.message);
-                }
-            }
+            await endInterviewFlow(false);
         };
     }
 
@@ -2463,11 +2557,11 @@ class KafkaVideoStreamer {
         }
     }
 
-    function stopKafkaStreaming() {
+    async function stopKafkaStreaming() {
         kafkaStreaming = false;
 
         if (kafkaVideoStreamer) {
-            kafkaVideoStreamer.stopVideoStreaming();
+            await kafkaVideoStreamer.stopVideoStreaming();
         }
 
         if (streamingInterval) {

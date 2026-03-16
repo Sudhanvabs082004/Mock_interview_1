@@ -37,6 +37,7 @@ from utils.hdfs_client import HDFSClient
 HTTP_SESSION = requests.Session()
 TTS_CACHE_DIR = os.path.join(settings.MEDIA_ROOT, 'tts_cache')
 LOCAL_AUDIO_RESPONSES_DIR = os.path.join(settings.MEDIA_ROOT, 'audio_responses')
+LOCAL_VIDEO_RECORDINGS_DIR = os.path.join(settings.MEDIA_ROOT, 'video_recordings')
 SERVER_TTS_ENABLED = getattr(settings, 'VOICE_INTERVIEW_TTS_ENABLED', False)
 INTERVIEW_ANALYSIS_MODEL = settings.OPENROUTER_CONFIG.get('MODEL', 'deepseek/deepseek-r1-0528')
 
@@ -77,6 +78,178 @@ def _save_audio_locally(interview, question_number, audio_bytes):
     return local_path
 
 
+def _get_local_video_recording_path(interview):
+    _ensure_directory(LOCAL_VIDEO_RECORDINGS_DIR)
+    return os.path.join(LOCAL_VIDEO_RECORDINGS_DIR, f"interview_{interview.id}.webm")
+
+
+def _append_video_chunk_locally(interview, video_bytes):
+    local_path = _get_local_video_recording_path(interview)
+    with open(local_path, 'ab') as video_file:
+        video_file.write(video_bytes)
+    return local_path
+
+
+def _save_video_locally(interview, video_bytes):
+    local_path = _get_local_video_recording_path(interview)
+    with open(local_path, 'wb') as video_file:
+        video_file.write(video_bytes)
+    return local_path
+
+
+def _get_local_video_size(interview):
+    local_path = _get_local_video_recording_path(interview)
+    if os.path.exists(local_path):
+        return os.path.getsize(local_path)
+    return 0
+
+
+def _get_video_hdfs_path(interview):
+    student = interview.student
+    student_profile = getattr(student, 'student_profile', None)
+    student_id = student_profile.student_id if student_profile else str(student.id)
+    student_name = f"{student.first_name}_{student.last_name}".replace(' ', '_').replace('.', '').replace('/', '')
+    folder_name = f"{student_name}_{student_id}_attempt_{interview.attempt_number}"
+    return f"/student_video_recordings/{folder_name}/interview_{interview.id}.webm"
+
+
+def _combine_kafka_video_chunks(frames_record):
+    if not frames_record:
+        return None
+
+    session_ids_to_try = []
+    if frames_record.video_session_id:
+        session_ids_to_try.append(frames_record.video_session_id)
+    if frames_record.kafka_session_id and frames_record.kafka_session_id not in session_ids_to_try:
+        session_ids_to_try.append(frames_record.kafka_session_id)
+
+    if not session_ids_to_try or not KAFKA_AVAILABLE:
+        return None
+
+    kafka_client = None
+    try:
+        kafka_client = KafkaFrameClient()
+        if not kafka_client.is_connected():
+            return None
+
+        for session_id in session_ids_to_try:
+            chunks = kafka_client.get_video_chunks(session_id)
+            if not chunks:
+                continue
+
+            combined_video_data = []
+            for chunk in sorted(chunks, key=lambda x: int(x.get('chunk_number', 0))):
+                video_data_b64 = (chunk.get('video_data') or '').strip()
+                if not video_data_b64:
+                    continue
+
+                missing_padding = len(video_data_b64) % 4
+                if missing_padding:
+                    video_data_b64 += '=' * (4 - missing_padding)
+
+                try:
+                    video_data = _decode_base64_payload(video_data_b64)
+                except Exception as decode_error:
+                    logger.warning("Skipping invalid video chunk for session %s: %s", session_id, decode_error)
+                    continue
+
+                if video_data:
+                    combined_video_data.append(video_data)
+
+            if combined_video_data:
+                return b''.join(combined_video_data)
+    except Exception as exc:
+        logger.error(f"Failed to combine Kafka video chunks: {exc}")
+    finally:
+        if kafka_client:
+            kafka_client.close()
+
+    return None
+
+
+def _decode_base64_payload(encoded_data):
+    if not encoded_data:
+        return None
+
+    normalized_data = encoded_data.strip()
+    if normalized_data.startswith('data:') and ',' in normalized_data:
+        normalized_data = normalized_data.split(',', 1)[1]
+
+    normalized_data = ''.join(normalized_data.split())
+    normalized_data = normalized_data.replace('-', '+').replace('_', '/')
+
+    missing_padding = (-len(normalized_data)) % 4
+    if missing_padding:
+        normalized_data += '=' * missing_padding
+
+    try:
+        return base64.b64decode(normalized_data)
+    except Exception:
+        return base64.urlsafe_b64decode(normalized_data)
+
+
+def _persist_video_recording(interview, frames_record):
+    local_video_path = _get_local_video_recording_path(interview)
+    video_bytes = None
+    video_source = None
+
+    if os.path.exists(local_video_path) and os.path.getsize(local_video_path) > 0:
+        with open(local_video_path, 'rb') as video_file:
+            video_bytes = video_file.read()
+        video_source = 'local'
+    else:
+        video_bytes = _combine_kafka_video_chunks(frames_record)
+        if video_bytes:
+            local_video_path = _save_video_locally(interview, video_bytes)
+            video_source = 'kafka'
+
+    if not video_bytes:
+        return {
+            'local_video_path': None,
+            'hdfs_video_path': None,
+            'video_source': None,
+            'saved': False,
+        }
+
+    hdfs_video_path = None
+    try:
+        hdfs_client = HDFSClient()
+        if hdfs_client.is_connected():
+            candidate_hdfs_path = _get_video_hdfs_path(interview)
+            if hdfs_client.write_file(candidate_hdfs_path, video_bytes):
+                hdfs_video_path = candidate_hdfs_path
+    except Exception as exc:
+        logger.warning(f"Failed to store video recording in HDFS for interview {interview.id}: {exc}")
+
+    return {
+        'local_video_path': local_video_path,
+        'hdfs_video_path': hdfs_video_path,
+        'video_source': video_source,
+        'saved': True,
+    }
+
+
+def _save_uploaded_video_recording(interview, video_file):
+    video_bytes = b''.join(video_file.chunks())
+    local_path = _save_video_locally(interview, video_bytes)
+
+    hdfs_video_path = None
+    try:
+        hdfs_client = HDFSClient()
+        if hdfs_client.is_connected():
+            candidate_hdfs_path = _get_video_hdfs_path(interview)
+            if hdfs_client.write_file(candidate_hdfs_path, video_bytes):
+                hdfs_video_path = candidate_hdfs_path
+    except Exception as exc:
+        logger.warning(f"Failed to upload final video recording to HDFS for interview {interview.id}: {exc}")
+
+    return {
+        'local_video_path': local_path,
+        'hdfs_video_path': hdfs_video_path,
+        'video_size': len(video_bytes),
+    }
+
+
 def _upload_audio_to_hdfs_in_background(response_id, interview_id, question_number, local_audio_path):
     close_old_connections()
     try:
@@ -112,7 +285,9 @@ def _build_question_audio_payload(agent, question_text):
             'audio_base64': None,
         }
 
-    audio_base64 = agent.text_to_speech_gtts(question_text)
+    # Browser speech synthesis is the primary path for question playback.
+    # Keep server TTS optional so question generation doesn't block when gTTS is slow.
+    audio_base64 = None
     return {
         'has_audio': audio_base64 is not None,
         'audio_base64': audio_base64,
@@ -151,6 +326,19 @@ Interview metadata:
 - Total questions answered: {len(context_entries)}
 
 Evaluate the candidate only from the question/answer transcript below.
+This evaluation must be strict and accuracy-first, not encouraging.
+
+Scoring rules:
+- 90-100: exceptional, consistently correct, deep, precise, interview-ready answers.
+- 75-89: strong answers with minor gaps, mostly correct, solid technical depth.
+- 60-74: mixed performance, partial correctness, shallow depth, noticeable gaps.
+- 40-59: weak performance, multiple incorrect or vague answers, poor structure.
+- 0-39: mostly wrong, irrelevant, extremely shallow, or "I don't know" type answers.
+- Penalize confidently incorrect answers more than cautious uncertainty.
+- Do not reward answer length unless it adds correct technical content.
+- If answers are vague, generic, or miss the question, keep technical_score and overall_score low.
+- For this technical interview, overall_score should stay close to technical_score and should not exceed it by more than 5 points.
+
 Return a strict JSON object with scores from 0 to 100 and concise bullet-style feedback.
 
 Transcript:
@@ -169,14 +357,97 @@ Required JSON format:
 """
 
 
-def _fallback_interview_scores(context_entries):
-    answered = [entry for entry in context_entries if entry.get('response')]
-    avg_length = sum(len(entry.get('response', '').split()) for entry in answered) / max(len(answered), 1)
-    technical_score = min(85.0, max(35.0, 35.0 + avg_length * 2.2))
-    communication_score = min(90.0, max(40.0, 40.0 + avg_length * 1.8))
-    confidence_score = min(88.0, max(38.0, 38.0 + avg_length * 1.6))
-    overall_score = round((technical_score * 0.5) + (communication_score * 0.3) + (confidence_score * 0.2), 1)
+def _collect_response_quality_metrics(context_entries):
+    answered = [entry for entry in context_entries if (entry.get('response') or '').strip()]
+    if not answered:
+        return {
+            'answered_count': 0,
+            'avg_length': 0.0,
+            'weak_ratio': 1.0,
+        }
+
+    weak_markers = (
+        "don't know",
+        "do not know",
+        "not sure",
+        "no idea",
+        "can't remember",
+        "cannot remember",
+        "i guess",
+        "maybe",
+        "probably",
+        "i think",
+    )
+
+    weak_count = 0
+    total_words = 0
+    for entry in answered:
+        response = (entry.get('response') or '').strip().lower()
+        total_words += len(response.split())
+        if any(marker in response for marker in weak_markers):
+            weak_count += 1
+
     return {
+        'answered_count': len(answered),
+        'avg_length': total_words / len(answered),
+        'weak_ratio': weak_count / len(answered),
+    }
+
+
+def _apply_scoring_guardrails(scores, context_entries):
+    metrics = _collect_response_quality_metrics(context_entries)
+
+    if metrics['answered_count'] == 0:
+        scores['technical_score'] = 0.0
+        scores['communication_score'] = 0.0
+        scores['confidence_score'] = 0.0
+        scores['overall_score'] = 0.0
+        return scores
+
+    if metrics['weak_ratio'] >= 0.6:
+        scores['technical_score'] = min(scores['technical_score'], 38.0)
+        scores['communication_score'] = min(scores['communication_score'], 48.0)
+        scores['confidence_score'] = min(scores['confidence_score'], 42.0)
+        scores['overall_score'] = min(scores['overall_score'], 42.0)
+    elif metrics['weak_ratio'] >= 0.35:
+        scores['technical_score'] = min(scores['technical_score'], 50.0)
+        scores['communication_score'] = min(scores['communication_score'], 58.0)
+        scores['confidence_score'] = min(scores['confidence_score'], 54.0)
+        scores['overall_score'] = min(scores['overall_score'], 55.0)
+
+    if metrics['avg_length'] < 6:
+        scores['technical_score'] = min(scores['technical_score'], 45.0)
+        scores['communication_score'] = min(scores['communication_score'], 52.0)
+        scores['confidence_score'] = min(scores['confidence_score'], 50.0)
+        scores['overall_score'] = min(scores['overall_score'], 50.0)
+    elif metrics['avg_length'] < 12:
+        scores['overall_score'] = min(scores['overall_score'], 64.0)
+
+    weighted_overall = round(
+        (scores['technical_score'] * 0.55) +
+        (scores['communication_score'] * 0.25) +
+        (scores['confidence_score'] * 0.20),
+        1,
+    )
+    scores['overall_score'] = min(scores['overall_score'], weighted_overall, scores['technical_score'] + 5.0)
+
+    for field in ['technical_score', 'communication_score', 'confidence_score', 'overall_score']:
+        scores[field] = round(max(0.0, min(100.0, float(scores[field]))), 1)
+
+    return scores
+
+
+def _fallback_interview_scores(context_entries):
+    metrics = _collect_response_quality_metrics(context_entries)
+    avg_length = metrics['avg_length']
+    weak_penalty = metrics['weak_ratio'] * 30.0
+
+    technical_score = min(72.0, max(18.0, 18.0 + avg_length * 1.5 - weak_penalty))
+    communication_score = min(76.0, max(24.0, 24.0 + avg_length * 1.25 - (metrics['weak_ratio'] * 18.0)))
+    confidence_score = min(74.0, max(20.0, 20.0 + avg_length * 1.1 - (metrics['weak_ratio'] * 24.0)))
+    overall_score = round((technical_score * 0.55) + (communication_score * 0.25) + (confidence_score * 0.2), 1)
+
+    scores = {
         'technical_score': round(technical_score, 1),
         'communication_score': round(communication_score, 1),
         'confidence_score': round(confidence_score, 1),
@@ -185,6 +456,7 @@ def _fallback_interview_scores(context_entries):
         'improvements': ['Add more technical depth', 'Use more structured explanations'],
         'summary': 'Fallback scoring was used because automated analysis was unavailable.',
     }
+    return _apply_scoring_guardrails(scores, context_entries)
 
 
 def _parse_interview_analysis(response_text, context_entries):
@@ -201,7 +473,7 @@ def _parse_interview_analysis(response_text, context_entries):
         parsed['strengths'] = parsed.get('strengths') or []
         parsed['improvements'] = parsed.get('improvements') or []
         parsed['summary'] = parsed.get('summary') or ''
-        return parsed
+        return _apply_scoring_guardrails(parsed, context_entries)
     except Exception as exc:
         logger.error(f"Failed to parse interview analysis response: {exc}")
         return _fallback_interview_scores(context_entries)
@@ -1070,14 +1342,15 @@ def stream_video_chunk(request):
 
         video_session_id = frames_record.video_session_id
 
-        success = False
+        kafka_success = False
+        local_save_success = False
 
         if KAFKA_AVAILABLE:
             try:
                 kafka_client = KafkaFrameClient()
 
                 if kafka_client.is_connected():
-                    success = kafka_client.send_video_chunk(
+                    kafka_success = kafka_client.send_video_chunk(
     session_id=video_session_id,
     chunk_number=chunk_number,
     video_data_b64=video_data,
@@ -1088,7 +1361,7 @@ def stream_video_chunk(request):
     user_id=request.user.id
 )
 
-                    if success:
+                    if kafka_success:
                         frames_record.total_video_chunks = max(
                             frames_record.total_video_chunks,
                             chunk_number + 1
@@ -1100,10 +1373,46 @@ def stream_video_chunk(request):
             except Exception as kafka_error:
                 print("VIDEO CHUNK KAFKA ERROR:", str(kafka_error))
 
+        try:
+            video_bytes = _decode_base64_payload(video_data)
+            local_path = _append_video_chunk_locally(interview, video_bytes)
+            local_save_success = True
+            logger.info(
+                "Saved local video chunk for interview %s: chunk=%s bytes=%s path=%s",
+                interview.id,
+                chunk_number,
+                len(video_bytes),
+                local_path,
+            )
+        except Exception as local_error:
+            logger.error(
+                "VIDEO CHUNK LOCAL SAVE ERROR: %s | length=%s | prefix=%s",
+                local_error,
+                len(video_data) if video_data else 0,
+                (video_data or '')[:40],
+            )
+
+        success = kafka_success or local_save_success
+        if success:
+            frames_record.total_video_chunks = max(
+                frames_record.total_video_chunks,
+                chunk_number + 1
+            )
+            if kafka_success and local_save_success:
+                frames_record.storage_method = 'both'
+            elif kafka_success:
+                frames_record.storage_method = 'kafka'
+            elif local_save_success:
+                frames_record.storage_method = 'hdfs'
+
+            update_fields = ['total_video_chunks', 'storage_method']
+            frames_record.save(update_fields=update_fields)
+
         return JsonResponse({
             'success': success,
             'chunk_number': chunk_number,
-            'video_session_id': video_session_id
+            'video_session_id': video_session_id,
+            'storage_method': frames_record.storage_method if success else 'none'
         })
 
     except Exception as e:
@@ -1189,68 +1498,24 @@ def get_kafka_video(request, interview_id):
             response['Accept-Ranges'] = 'bytes'
             return response
 
-        # Get video chunks from Kafka
-        session_ids_to_try = []
-        if frames_record.video_session_id:
-            session_ids_to_try.append(frames_record.video_session_id)
-        if frames_record.kafka_session_id:
-            session_ids_to_try.append(frames_record.kafka_session_id)
+        local_video_path = _get_local_video_recording_path(interview)
+        if os.path.exists(local_video_path):
+            with open(local_video_path, 'rb') as video_file:
+                full_video = video_file.read()
 
-        video_chunks = None
-        if KAFKA_AVAILABLE:
-            try:
-                kafka_client = KafkaFrameClient()
-                if kafka_client.is_connected():
-                    for session_id in session_ids_to_try:
-                        chunks = kafka_client.get_video_chunks(session_id)
-                        if chunks:
-                            video_chunks = chunks
-                            break
-                kafka_client.close()
-            except Exception as e:
-                logger.error(f"Kafka error: {e}")
-                return JsonResponse({'error': 'Kafka service error'}, status=500)
+            response = HttpResponse(full_video, content_type='video/webm')
+            response['Content-Length'] = str(len(full_video))
+            response['Accept-Ranges'] = 'bytes'
+            response['Content-Disposition'] = f'inline; filename="interview_{interview_id}.webm"'
+            response['Cache-Control'] = 'public, max-age=3600'
+            response['X-Video-Source'] = 'local'
+            return response
 
-        if not video_chunks:
+        full_video = _combine_kafka_video_chunks(frames_record)
+        if not full_video:
             return JsonResponse({'error': 'No video chunks found'}, status=404)
-
-        # Sort chunks and combine them
-        sorted_chunks = sorted(video_chunks, key=lambda x: int(x.get('chunk_number', 0)))
-        logger.info(f"Combining {len(sorted_chunks)} chunks into video")
-
-        # WORKING APPROACH: Combine all chunks into one video
-        combined_video_data = []
-        successful_chunks = 0
-
-        for i, chunk in enumerate(sorted_chunks):
-            try:
-                video_data_b64 = chunk.get('video_data', '')
-                if not video_data_b64:
-                    continue
-
-                # Decode chunk
-                video_data_b64 = video_data_b64.strip()
-                missing_padding = len(video_data_b64) % 4
-                if missing_padding:
-                    video_data_b64 += '=' * (4 - missing_padding)
-
-                video_data = base64.b64decode(video_data_b64)
-                if len(video_data) > 0:
-                    combined_video_data.append(video_data)
-                    successful_chunks += 1
-
-            except Exception as e:
-                logger.warning(f"Failed to decode chunk {i}: {e}")
-                continue
-
-        if not combined_video_data:
-            return JsonResponse({'error': 'No valid chunks found'}, status=404)
-
-        # Combine all video data
-        full_video = b''.join(combined_video_data)
         total_size = len(full_video)
-
-        logger.info(f"✅ Combined {successful_chunks} chunks into {total_size / 1024 / 1024:.2f}MB video")
+        logger.info(f"✅ Combined Kafka video into {total_size / 1024 / 1024:.2f}MB video")
 
         # Return the complete video
         response = HttpResponse(full_video, content_type='video/webm')
@@ -1286,8 +1551,11 @@ def get_video_info(request, interview_id):
                 'interview_id': interview_id
             }, status=404)
 
+        local_video_size = _get_local_video_size(interview)
+        local_video_available = local_video_size > 0
+
         # Quick check: if we know there are 0 video chunks, return immediately
-        if hasattr(frames_record, 'total_video_chunks') and frames_record.total_video_chunks == 0:
+        if hasattr(frames_record, 'total_video_chunks') and frames_record.total_video_chunks == 0 and not local_video_available:
             return JsonResponse({
                 'success': True,
                 'interview_id': interview_id,
@@ -1305,6 +1573,7 @@ def get_video_info(request, interview_id):
                     'kafka_available': KAFKA_AVAILABLE,
                     'video_session_id': frames_record.video_session_id,  # ← ADD THIS
                     'frame_session_id': frames_record.kafka_session_id,  # ← ADD THIS
+                    'local_video_available': local_video_available,
                     'error_message': 'No video chunks were recorded during this interview',
                     'interview_completed': interview.status == 'completed',
                     'quick_check': True
@@ -1364,14 +1633,14 @@ def get_video_info(request, interview_id):
         return JsonResponse({
             'success': True,
             'interview_id': interview_id,
-            'video_available': chunk_count > 0,
-            'total_chunks': chunk_count,
+            'video_available': chunk_count > 0 or local_video_available,
+            'total_chunks': chunk_count if chunk_count > 0 else frames_record.total_video_chunks,
             'video_url': f'/interview/api/kafka-video/{interview_id}/',
             'interview_info': {
                 'student_name': interview.student.get_full_name(),
                 'completed_at': interview.completed_at.isoformat() if interview.completed_at else None,
                 'attempt_number': interview.attempt_number,
-                'duration_estimate': f'~{chunk_count * 3} seconds' if chunk_count > 0 else 'No video recorded',
+                'duration_estimate': f'~{(chunk_count if chunk_count > 0 else frames_record.total_video_chunks) * 3} seconds' if (chunk_count > 0 or local_video_available) else 'No video recorded',
                 'interview_status': interview.status
             },
             'debug_info': {
@@ -1379,6 +1648,8 @@ def get_video_info(request, interview_id):
                 'video_session_id': frames_record.video_session_id,
                 'frame_session_id': frames_record.kafka_session_id,
                 'total_video_chunks_db': frames_record.total_video_chunks,
+                'local_video_available': local_video_available,
+                'local_video_size': local_video_size,
                 'error_message': error_message,
                 'interview_completed': interview.status == 'completed'
             }
@@ -1474,6 +1745,63 @@ def save_audio_response(request):
     except Exception as e:
         logger.error(f"Error saving audio response: {str(e)}")
         return JsonResponse({'error': 'Failed to save audio response'}, status=500)
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def save_video_recording(request):
+    """Save the final interview video recording to local storage and optionally HDFS."""
+    try:
+        if not request.user.is_authenticated:
+            return JsonResponse({'error': 'Authentication required'}, status=401)
+
+        interview_id = request.POST.get('interview_id')
+        interview_queryset = Interview.objects.filter(student=request.user)
+        if interview_id:
+            interview_queryset = interview_queryset.filter(id=interview_id)
+
+        interview = interview_queryset.order_by('-id').first()
+
+        if not interview:
+            return JsonResponse({'error': 'Interview not found'}, status=404)
+
+        video_file = request.FILES.get('video')
+        if not video_file:
+            return JsonResponse({'error': 'Missing video file'}, status=400)
+
+        save_result = _save_uploaded_video_recording(interview, video_file)
+
+        frames_record, _created = InterviewFrames.objects.get_or_create(
+            interview=interview,
+            defaults={
+                'video_session_id': f"video_session_{interview.id}",
+                'total_video_chunks': 1,
+                'video_recording_started_at': timezone.now(),
+            }
+        )
+
+        frames_record.video_recording_ended_at = timezone.now()
+        frames_record.total_video_chunks = max(frames_record.total_video_chunks, 1)
+        frames_record.storage_method = 'both' if KAFKA_AVAILABLE else 'hdfs'
+        frames_record.save(update_fields=[
+            'video_recording_ended_at',
+            'total_video_chunks',
+            'storage_method',
+        ])
+
+        interview.has_video_recording = True
+        interview.save(update_fields=['has_video_recording'])
+
+        return JsonResponse({
+            'success': True,
+            'local_video_path': save_result['local_video_path'],
+            'hdfs_video_path': save_result['hdfs_video_path'],
+            'video_size': save_result['video_size'],
+        })
+
+    except Exception as e:
+        logger.error(f"Error saving video recording: {str(e)}", exc_info=True)
+        return JsonResponse({'error': 'Failed to save video recording'}, status=500)
 
 
 @csrf_exempt
@@ -1689,6 +2017,18 @@ def end_interview(request):
             interview.has_frame_data = frames_record.total_frames > 0
             interview.save(update_fields=['has_video_recording', 'has_frame_data'])
 
+            video_persistence = _persist_video_recording(interview, frames_record)
+            if video_persistence['saved']:
+                logger.info(
+                    "Video recording persisted for interview %s from %s source. local=%s hdfs=%s",
+                    interview.id,
+                    video_persistence['video_source'],
+                    video_persistence['local_video_path'],
+                    video_persistence['hdfs_video_path'],
+                )
+            else:
+                logger.warning("No complete video recording could be persisted for interview %s", interview.id)
+
         if voice_session and voice_session.current_question_number >= interview.total_questions and not interview.analysis_completed:
             interview.processing_status = 'processing'
             interview.save(update_fields=['processing_status'])
@@ -1748,11 +2088,15 @@ def get_current_interview(request):
                 'error': 'No active interview found'
             }, status=404)
 
+        frames_record = InterviewFrames.objects.filter(interview=interview).first()
+
         return JsonResponse({
             'success': True,
             'interview_id': interview.id,
             'status': interview.status,
-            'started_at': interview.started_at.isoformat() if interview.started_at else None
+            'started_at': interview.started_at.isoformat() if interview.started_at else None,
+            'frame_session_id': frames_record.kafka_session_id if frames_record else None,
+            'video_session_id': frames_record.video_session_id if frames_record else None,
         })
 
     except Exception as e:
@@ -2509,6 +2853,18 @@ def get_reconstructed_video(request, interview_id):
         if not frames_record:
             return JsonResponse({'error': 'No video session found'}, status=404)
 
+        local_video_path = _get_local_video_recording_path(interview)
+        if os.path.exists(local_video_path):
+            with open(local_video_path, 'rb') as video_file:
+                video_data = video_file.read()
+
+            response = HttpResponse(video_data, content_type='video/webm')
+            response['Content-Length'] = str(len(video_data))
+            response['Accept-Ranges'] = 'bytes'
+            response['Content-Disposition'] = f'inline; filename="interview_{interview_id}_local.webm"'
+            response['X-Video-Source'] = 'local'
+            return response
+
         # Get video chunks from Kafka
         session_ids_to_try = []
         if frames_record.video_session_id:
@@ -3255,12 +3611,25 @@ def process_voice_response(request):
         if current_question_number >= interview.total_questions:
             voice_session.complete_session(reason='completed')
 
+            interview.status = 'completed'
+            interview.completed_at = timezone.now()
             interview.voice_interview_completed = True
             interview.completion_reason = 'all_questions_answered'
             interview.questions_answered = interview.total_questions
             interview.completion_percentage = 100
             interview.processing_status = 'processing'
-            interview.save()
+            if interview.started_at:
+                interview.interview_duration_seconds = int((timezone.now() - interview.started_at).total_seconds())
+            interview.save(update_fields=[
+                'status',
+                'completed_at',
+                'voice_interview_completed',
+                'completion_reason',
+                'questions_answered',
+                'completion_percentage',
+                'processing_status',
+                'interview_duration_seconds',
+            ])
 
             threading.Thread(
                 target=_run_final_interview_analysis,
@@ -3271,7 +3640,9 @@ def process_voice_response(request):
             return JsonResponse({
                 'success': True,
                 'interview_complete': True,
-                'transcription': transcription
+                'transcription': transcription,
+                'message': 'Interview over.',
+                'redirect_url': '/',
             })
 
         next_question_number = current_question_number + 1

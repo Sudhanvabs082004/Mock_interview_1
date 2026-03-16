@@ -46,11 +46,18 @@ class InterviewSessionManager:
                     "analysis_completed": interview.analysis_completed
                 },
                 "interview_questions": {},
+                "video_recording": {
+                    "video_file_path": None,
+                    "local_video_file_path": None,
+                    "video_saved_to_hdfs": False,
+                    "total_video_chunks": 0,
+                },
                 "session_summary": {
                     "total_questions": 0,
                     "questions_answered": 0,
                     "total_duration_minutes": 0,
-                    "audio_responses_stored": 0
+                    "audio_responses_stored": 0,
+                    "video_recording_stored": False,
                 }
             }
 
@@ -67,10 +74,22 @@ class InterviewSessionManager:
 
             # Store audio responses separately
             audio_storage_path = self._store_audio_responses(interview, student_name, student_id)
+            local_video_path = self._get_local_video_path(interview)
+            video_storage_path = self._store_video_recording(interview, local_video_path, student_name, student_id)
+
+            frames = getattr(interview, 'frames', None)
+            session_data["video_recording"] = {
+                "video_file_path": video_storage_path or local_video_path,
+                "local_video_file_path": local_video_path,
+                "video_saved_to_hdfs": bool(video_storage_path and video_storage_path.startswith('/student_video_recordings/')),
+                "total_video_chunks": frames.total_video_chunks if frames else 0,
+            }
 
             session_data["storage_info"] = {
                 "json_hdfs_path": hdfs_path,
                 "audio_storage_path": audio_storage_path,
+                "video_storage_path": video_storage_path,
+                "local_video_path": local_video_path,
                 "stored_at": datetime.now().isoformat()
             }
 
@@ -83,24 +102,24 @@ class InterviewSessionManager:
     def _process_voice_session(self, session_data, voice_session):
         """Process voice interview session data"""
         try:
+            from .models import InterviewResponse
+
             # Get all interview context entries
             if isinstance(voice_session.interview_context, list):
                 contexts = voice_session.interview_context
             else:
                 contexts = voice_session.interview_context.get('questions', []) if voice_session.interview_context else []
             
-            # Get student info for path construction
             interview = voice_session.interview
-            student = interview.student
-            student_profile = getattr(student, 'student_profile', None)
-            student_id = student_profile.student_id if student_profile else 'UNKNOWN'
-            student_name = f"{student.first_name}_{student.last_name}".replace(' ', '_')
+            responses_by_question = {
+                response.question_id: response
+                for response in InterviewResponse.objects.filter(interview=interview).select_related('question')
+            }
             
             for context in contexts:
                 question_num = context.get('question_number', 0)
-                
-                # Construct HDFS audio path
-                hdfs_audio_path = f"/student_audio_responses/{student_name}_{student_id}_attempt_{interview.attempt_number}/question_{question_num}_response.webm"
+                question_id = context.get('question_id')
+                response = responses_by_question.get(question_id)
                 
                 session_data["interview_questions"][f"question_{question_num}"] = {
                     "question_number": question_num,
@@ -108,8 +127,9 @@ class InterviewSessionManager:
                     "ai_question": context.get('ai_question', ''),
                     "human_response": context.get('response', ''),
                     "timestamp": context.get('timestamp', ''),
-                    "audio_file_path": hdfs_audio_path,
-                    "audio_saved_to_hdfs": context.get('audio_file_saved', False)
+                    "audio_file_path": response.audio_file_path if response else None,
+                    "local_audio_file_path": response.local_file_path if response else None,
+                    "audio_saved_to_hdfs": bool(response and response.audio_file_path and response.audio_file_path.startswith('/student_audio_responses/'))
                 }
                     
         except Exception as e:
@@ -140,7 +160,8 @@ class InterviewSessionManager:
             "total_questions": len(questions),
             "questions_answered": len([q for q in questions.values() if q.get('human_response')]),
             "total_duration_minutes": self._calculate_duration(interview),
-            "audio_responses_stored": len([q for q in questions.values() if q.get('human_response')])
+            "audio_responses_stored": len([q for q in questions.values() if q.get('human_response')]),
+            "video_recording_stored": bool(session_data.get("video_recording", {}).get("video_file_path")),
         }
 
     def _calculate_duration(self, interview):
@@ -234,3 +255,32 @@ class InterviewSessionManager:
         except Exception as e:
             logger.error(f"Error processing audio responses: {e}")
             return None
+
+    def _get_local_video_path(self, interview):
+        """Return local fallback video path if it exists."""
+        local_path = os.path.join(settings.MEDIA_ROOT, 'video_recordings', f'interview_{interview.id}.webm')
+        return local_path if os.path.exists(local_path) else None
+
+    def _store_video_recording(self, interview, local_video_path, student_name, student_id):
+        """Store final interview video in HDFS when a local recording exists."""
+        if not local_video_path or not os.path.exists(local_video_path):
+            return None
+
+        try:
+            if not self.hdfs_client.is_connected():
+                logger.warning("HDFS not connected, skipping video upload")
+                return None
+
+            folder_name = f"{student_name}_{student_id}_attempt_{interview.attempt_number}"
+            hdfs_path = f"/student_video_recordings/{folder_name}/interview_{interview.id}.webm"
+
+            with open(local_video_path, 'rb') as video_file:
+                video_bytes = video_file.read()
+
+            if self.hdfs_client.write_file(hdfs_path, video_bytes):
+                logger.info(f"Stored interview video in HDFS: {hdfs_path}")
+                return hdfs_path
+        except Exception as e:
+            logger.error(f"Error storing video recording for interview {interview.id}: {e}")
+
+        return None
