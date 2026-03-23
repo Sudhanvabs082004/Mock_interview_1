@@ -501,6 +501,48 @@
        </div>
       </div>
      </div>
+     <div class="mt-4 grid grid-cols-2 md:grid-cols-5 gap-3 text-sm">
+      <div class="bg-gray-700 rounded-lg p-3">
+       <div class="text-gray-400">
+        Detection Status
+       </div>
+       <div class="font-semibold text-yellow-300" id="detectionStatusLabel">
+        Waiting...
+       </div>
+      </div>
+      <div class="bg-gray-700 rounded-lg p-3">
+       <div class="text-gray-400">
+        Face
+       </div>
+       <div class="font-semibold text-gray-200" id="faceDetectionLabel">
+        Unknown
+       </div>
+      </div>
+      <div class="bg-gray-700 rounded-lg p-3">
+       <div class="text-gray-400">
+        Multiple Faces
+       </div>
+       <div class="font-semibold text-gray-200" id="multipleFacesLabel">
+        Unknown
+       </div>
+      </div>
+      <div class="bg-gray-700 rounded-lg p-3">
+       <div class="text-gray-400">
+        Attention
+       </div>
+       <div class="font-semibold text-gray-200" id="attentionLabel">
+        Unknown
+       </div>
+      </div>
+      <div class="bg-gray-700 rounded-lg p-3">
+       <div class="text-gray-400">
+        Device
+       </div>
+       <div class="font-semibold text-gray-200" id="deviceDetectionLabel">
+        Unknown
+       </div>
+      </div>
+     </div>
     </div>
    </div>
    <div class="space-y-6">
@@ -799,6 +841,9 @@
     let hasFocus = true;
     let proctoringStartTime = null;
     let violations = [];
+    let detectionEvents = [];
+    let lastDetectionSignature = null;
+    let lastDetectionRecordedAt = 0;
     let interviewTerminated = false;
 
     // Voice interview variables
@@ -1487,25 +1532,7 @@ async startListening() {
                 this.isActive = false;
                 this.addToConversation('ai', message, this.questionNumber + 1);
                 this.updateAIStatus('completed', 'Interview completed!');
-
-                try {
-                    frontendProctoring.stop();
-                    proctoringActive = false;
-                    await stopKafkaStreaming();
-                } catch (error) {
-                    console.error('Error stopping interview media during completion:', error);
-                }
-
-                if (document.exitFullscreen) {
-                    try {
-                        await document.exitFullscreen();
-                    } catch (error) {
-                        console.warn('Failed to exit fullscreen:', error);
-                    }
-                }
-
-                alert(message || 'Interview over.');
-                window.location.replace(redirectUrl || '/');
+                await endInterviewFlow(true, true);
             }
 
             startSilenceDetection() {
@@ -2089,11 +2116,13 @@ class KafkaVideoStreamer {
                 type,
                 message,
                 timestamp: new Date().toISOString(),
-                timeFromStart: Date.now() - proctoringStartTime
+                timeFromStart: Date.now() - proctoringStartTime,
+                question_number: voiceInterviewManager.questionNumber || 0
             };
 
             violations.push(violation);
             violationCount++;
+            this.persistViolation(violation);
 
             this.saveViolationsToStorage();
             this.updateViolationCounter();
@@ -2103,6 +2132,23 @@ class KafkaVideoStreamer {
             } else {
                 this.showViolationWarning(violation);
             }
+        }
+
+        persistViolation(violation) {
+            fetch('/interview/api/log-proctoring-violation/', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRFToken': getCookie('csrftoken')
+                },
+                body: JSON.stringify({
+                    interview_id: interviewId,
+                    violation: violation
+                }),
+                keepalive: true
+            }).catch(error => {
+                console.error('Failed to persist violation:', error);
+            });
         }
 
         saveViolationsToStorage() {
@@ -2354,7 +2400,14 @@ class KafkaVideoStreamer {
                 headers: {
                     'X-CSRFToken': getCookie('csrftoken'),
                     'Content-Type': 'application/json'
-                }
+                },
+                body: JSON.stringify({
+                    interview_id: interviewId,
+                    violation_count: violationCount,
+                    violations: violations,
+                    detection_events: detectionEvents,
+                    proctoring_started_at: proctoringStartTime ? new Date(proctoringStartTime).toISOString() : null
+                })
             });
 
             const result = await response.json();
@@ -2544,10 +2597,19 @@ class KafkaVideoStreamer {
             });
 
             if (response.ok) {
-                framesStreamed++;
-                document.getElementById('framesStreamed').textContent = framesStreamed;
-                document.getElementById('frameCount').textContent = framesStreamed;
-                updateStreamStatus('streaming');
+                const result = await response.json();
+                if (result.live_detection) {
+                    updateLiveDetectionUI(result.live_detection);
+                }
+                if (result.success) {
+                    framesStreamed++;
+                    document.getElementById('framesStreamed').textContent = framesStreamed;
+                    document.getElementById('frameCount').textContent = framesStreamed;
+                    updateStreamStatus('streaming');
+                } else {
+                    console.warn('Frame stream rejected by backend:', result.message || result.error);
+                    updateStreamStatus('error');
+                }
             } else {
                 updateStreamStatus('error');
             }
@@ -2555,6 +2617,76 @@ class KafkaVideoStreamer {
             console.error('Frame streaming error:', error);
             updateStreamStatus('error');
         }
+    }
+
+    function updateLiveDetectionUI(detection) {
+        const detectionStatusLabel = document.getElementById('detectionStatusLabel');
+        const faceDetectionLabel = document.getElementById('faceDetectionLabel');
+        const multipleFacesLabel = document.getElementById('multipleFacesLabel');
+        const attentionLabel = document.getElementById('attentionLabel');
+        const deviceDetectionLabel = document.getElementById('deviceDetectionLabel');
+
+        if (!detectionStatusLabel || !faceDetectionLabel || !multipleFacesLabel || !attentionLabel || !deviceDetectionLabel) {
+            return;
+        }
+
+        const statusMap = {
+            focused: { text: 'Focused', className: 'font-semibold text-green-300' },
+            looking_away: { text: 'Looking Away', className: 'font-semibold text-red-300' },
+            multiple_faces: { text: 'Multiple Faces', className: 'font-semibold text-red-300' },
+            no_face: { text: 'No Face', className: 'font-semibold text-yellow-300' },
+            eyes_not_visible: { text: 'Eyes Unclear', className: 'font-semibold text-yellow-300' },
+            device_detected: { text: 'Device Detected', className: 'font-semibold text-red-300' },
+            analysis_unavailable: { text: 'Unavailable', className: 'font-semibold text-gray-300' }
+        };
+
+        const statusConfig = statusMap[detection.status] || statusMap.analysis_unavailable;
+        detectionStatusLabel.textContent = statusConfig.text;
+        detectionStatusLabel.className = statusConfig.className;
+
+        faceDetectionLabel.textContent = detection.face_detected ? `Detected (${detection.face_count})` : 'Not Detected';
+        faceDetectionLabel.className = detection.face_detected ? 'font-semibold text-green-300' : 'font-semibold text-yellow-300';
+
+        multipleFacesLabel.textContent = detection.multiple_faces ? 'Yes' : 'No';
+        multipleFacesLabel.className = detection.multiple_faces ? 'font-semibold text-red-300' : 'font-semibold text-green-300';
+
+        attentionLabel.textContent = detection.looking_away ? 'Away' : (detection.no_face ? 'No Face' : 'On Screen');
+        attentionLabel.className = detection.looking_away ? 'font-semibold text-red-300' : 'font-semibold text-green-300';
+
+        deviceDetectionLabel.textContent = detection.device_detected ? `Detected (${detection.device_count || 1})` : 'Clear';
+        deviceDetectionLabel.className = detection.device_detected ? 'font-semibold text-red-300' : 'font-semibold text-green-300';
+
+        recordDetectionEvent(detection);
+    }
+
+    function recordDetectionEvent(detection) {
+        const signature = `${voiceInterviewManager.questionNumber || 0}:${detection.status}:${detection.face_count || 0}:${detection.device_count || 0}`;
+        const now = Date.now();
+        if (lastDetectionSignature === signature && (now - lastDetectionRecordedAt) < 8000) {
+            return;
+        }
+
+        lastDetectionSignature = signature;
+        lastDetectionRecordedAt = now;
+
+        const messageMap = {
+            focused: 'Candidate remained focused and visible on screen',
+            looking_away: 'Candidate appeared to look away from the screen',
+            multiple_faces: 'Multiple faces were detected in the frame',
+            no_face: 'No face was detected in the frame',
+            eyes_not_visible: 'Eyes were not clearly visible in the frame',
+            device_detected: 'A gadget or handheld device was detected in the webcam frame'
+        };
+
+        detectionEvents.push({
+            type: detection.status,
+            message: messageMap[detection.status] || detection.status,
+            timestamp: new Date().toISOString(),
+            question_number: voiceInterviewManager.questionNumber || 0,
+            face_count: detection.face_count || 0,
+            eyes_detected: detection.eyes_detected || 0,
+            device_count: detection.device_count || 0
+        });
     }
 
     async function stopKafkaStreaming() {

@@ -22,6 +22,7 @@ urlpatterns = [
     path('api/save-audio/', views.save_audio_response, name='save_audio_response'),
     path('api/save-video/', views.save_video_recording, name='save_video_recording'),
     path('api/stream-frame/', views.stream_frame, name='stream_frame'),
+    path('api/log-proctoring-violation/', views.log_proctoring_violation, name='log_proctoring_violation'),
     path('api/upload-frames/', views.upload_video_frames, name='upload_video_frames'),
     path('api/end/', views.end_interview, name='end_interview'),
     path('api/request-interview/', views.request_interview, name='request_interview'),

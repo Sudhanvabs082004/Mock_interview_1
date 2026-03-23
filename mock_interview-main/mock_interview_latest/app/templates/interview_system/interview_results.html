@@ -42,7 +42,7 @@
     }
 
     .score-box {
-        background: linear-gradient(135deg, #2563eb, #1e3a8a);
+        background: #111827;
         color: white;
         padding: 25px;
         border-radius: 12px;
@@ -108,29 +108,51 @@
 
         <div class="score-box">
             <h3>Technical Score</h3>
-            <p>{{ interview.technical_score|default:"0" }} / 100</p>
+            <p style="background: linear-gradient(135deg, {{ display_scores.technical.color }}, #1f2937); border-radius: 10px; padding: 14px 10px;">
+                {{ display_scores.technical.value|floatformat:1 }} / 10
+            </p>
         </div>
 
         <div class="score-box">
             <h3>Communication</h3>
-            <p>{{ interview.communication_score|default:"0" }} / 100</p>
+            <p style="background: linear-gradient(135deg, {{ display_scores.communication.color }}, #1f2937); border-radius: 10px; padding: 14px 10px;">
+                {{ display_scores.communication.value|floatformat:1 }} / 10
+            </p>
         </div>
 
         <div class="score-box">
             <h3>Confidence</h3>
-            <p>{{ interview.confidence_score|default:"0" }} / 100</p>
+            <p style="background: linear-gradient(135deg, {{ display_scores.confidence.color }}, #1f2937); border-radius: 10px; padding: 14px 10px;">
+                {{ display_scores.confidence.value|floatformat:1 }} / 10
+            </p>
         </div>
 
         <div class="score-box">
             <h3>Overall Score</h3>
-            <p>{{ interview.overall_score|default:"0" }} / 100</p>
+            <p style="background: linear-gradient(135deg, {{ display_scores.overall.color }}, #1f2937); border-radius: 10px; padding: 14px 10px;">
+                {{ display_scores.overall.value|floatformat:1 }} / 10
+            </p>
         </div>
 
     </div>
 
     <div class="meta-info">
         Attempt: {{ interview.attempt_number }} <br>
-        Completed At: {{ interview.completed_at }}
+        Completed At: {{ interview.completed_at }} <br>
+        Violations: {{ proctoring_summary.violation_count }}
+    </div>
+
+    <div style="margin-top: 24px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 12px; padding: 20px;">
+        <h3 style="margin-top: 0; color: #111827;">Proctoring Violations</h3>
+        {% if proctoring_summary.violations %}
+            <ul style="color: #374151; line-height: 1.8; padding-left: 20px;">
+                {% for violation in proctoring_summary.violations %}
+                    <li>{{ violation.message }} - {{ violation.timestamp }}</li>
+                {% endfor %}
+            </ul>
+        {% else %}
+            <p style="color: #6b7280; margin-bottom: 0;">No proctoring violations were recorded during this interview.</p>
+        {% endif %}
     </div>
 
     <div class="actions">

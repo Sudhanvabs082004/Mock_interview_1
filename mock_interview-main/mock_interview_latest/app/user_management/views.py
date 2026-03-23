@@ -10,7 +10,9 @@ from django.db import transaction
 from django.db import models
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
+from django.urls import reverse
 from datetime import timedelta
+from urllib.parse import urlencode
 import json
 from .models import CustomUser, StudentProfile
 from interview_system.models import Interview
@@ -142,6 +144,20 @@ def logout_view(request):
     logout(request)
     messages.info(request, f'Goodbye {user_name}! You have been logged out.')
     return redirect('login')
+
+
+def django_admin_login_view(request):
+    """
+    Force Django Admin to ask for credentials again by clearing the current
+    session before redirecting to the admin login page.
+    """
+    if request.user.is_authenticated:
+        logout(request)
+
+    admin_login_url = reverse('admin:login')
+    admin_index_url = reverse('admin:index')
+    query_string = urlencode({'next': admin_index_url})
+    return redirect(f'{admin_login_url}?{query_string}')
 
 
 @login_required

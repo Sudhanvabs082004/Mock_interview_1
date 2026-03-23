@@ -7,6 +7,7 @@ urlpatterns = [
     path('login/', views.login_view, name='login'),
     path('register/', views.register_view, name='register'),
     path('logout/', views.logout_view, name='logout'),
+    path('django-admin-login/', views.django_admin_login_view, name='django_admin_login'),
     
     # Debug endpoint (temporary for CSRF troubleshooting)
     path('debug-headers/', views.debug_headers, name='debug_headers'),

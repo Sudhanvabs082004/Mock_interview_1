@@ -19,6 +19,9 @@ class InterviewSessionManager:
         try:
             interview = Interview.objects.get(id=interview_id)
             voice_session = VoiceInterviewSession.objects.filter(interview=interview).first()
+            session_metadata = voice_session.session_data if voice_session and isinstance(voice_session.session_data, dict) else {}
+            proctoring_summary = session_metadata.get('proctoring_summary') or {}
+            detection_summary = session_metadata.get('detection_summary') or {}
 
             # Get student info
             student = interview.student
@@ -43,7 +46,8 @@ class InterviewSessionManager:
                     "communication_score": interview.communication_score,
                     "confidence_score": interview.confidence_score,
                     "cheating_detected": interview.cheating_detected,
-                    "analysis_completed": interview.analysis_completed
+                    "analysis_completed": interview.analysis_completed,
+                    "violation_count": int(proctoring_summary.get('violation_count') or 0),
                 },
                 "interview_questions": {},
                 "video_recording": {
@@ -58,19 +62,21 @@ class InterviewSessionManager:
                     "total_duration_minutes": 0,
                     "audio_responses_stored": 0,
                     "video_recording_stored": False,
-                }
+                },
+                "proctoring_summary": {
+                    "violation_count": int(proctoring_summary.get('violation_count') or 0),
+                    "violations": proctoring_summary.get('violations') or [],
+                    "proctoring_started_at": proctoring_summary.get('proctoring_started_at'),
+                },
+                "detection_summary": {
+                    "event_count": int(detection_summary.get('event_count') or 0),
+                    "events": detection_summary.get('events') or [],
+                },
             }
 
             # Process voice session if exists
             if voice_session and voice_session.interview_context:
                 self._process_voice_session(session_data, voice_session)
-
-            # Calculate summary
-            self._calculate_session_summary(session_data, interview)
-
-            # Store in HDFS
-            filename = f"{student_name}_{student_id}_attempt_{interview.attempt_number}_interview_{interview.id}.json"
-            hdfs_path = self._store_session_json(session_data, filename)
 
             # Store audio responses separately
             audio_storage_path = self._store_audio_responses(interview, student_name, student_id)
@@ -86,12 +92,28 @@ class InterviewSessionManager:
             }
 
             session_data["storage_info"] = {
-                "json_hdfs_path": hdfs_path,
+                "json_hdfs_path": None,
                 "audio_storage_path": audio_storage_path,
                 "video_storage_path": video_storage_path,
                 "local_video_path": local_video_path,
                 "stored_at": datetime.now().isoformat()
             }
+
+            # Calculate summary after audio/video fields are finalized.
+            self._calculate_session_summary(session_data, interview)
+
+            filename = f"{student_name}_{student_id}_attempt_{interview.attempt_number}_interview_{interview.id}.json"
+            stored_json_path = self._store_session_json(session_data, filename)
+            session_data["storage_info"]["json_hdfs_path"] = stored_json_path
+
+            logger.info(
+                "SESSION JSON WRITTEN | interview_id=%s | path=%s | top_level_keys=%s | violation_count=%s | detection_event_count=%s",
+                interview.id,
+                stored_json_path,
+                list(session_data.keys()),
+                session_data.get("proctoring_summary", {}).get("violation_count", 0),
+                session_data.get("detection_summary", {}).get("event_count", 0),
+            )
 
             return session_data
 
@@ -214,6 +236,13 @@ class InterviewSessionManager:
                 json.dump(session_data, f, indent=2, ensure_ascii=False)
 
             logger.info(f"Session JSON stored locally at: {local_path}")
+            logger.info(
+                "LOCAL SESSION JSON CONTENT CHECK | path=%s | has_proctoring=%s | has_detection=%s | has_storage_info=%s",
+                local_path,
+                "proctoring_summary" in session_data,
+                "detection_summary" in session_data,
+                "storage_info" in session_data,
+            )
             return local_path
 
         except Exception as e:

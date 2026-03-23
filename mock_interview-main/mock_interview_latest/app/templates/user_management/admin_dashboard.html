@@ -17,7 +17,7 @@
                    <button @click="refreshData()" class="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition duration-200">
                        <i class="fas fa-sync-alt mr-2"></i>Refresh
                    </button>
-                   <a href="/admin/" class="bg-gray-600 text-white px-4 py-2 rounded-lg hover:bg-gray-700 transition duration-200">
+                   <a href="{% url 'django_admin_login' %}" class="bg-gray-600 text-white px-4 py-2 rounded-lg hover:bg-gray-700 transition duration-200">
                        <i class="fas fa-cogs mr-2"></i>Django Admin
                    </a>
                    <a href="{% url 'logout' %}" class="text-gray-600 hover:text-gray-900">
@@ -1115,7 +1115,7 @@ viewVideoRecording(interviewId) {
                 console.log('Kafka Available:', data.debug_info.kafka_available);
             }
             
-            if (data.success && data.video_available && data.total_chunks > 0) {
+            if (data.success && data.video_available) {
                 this.showVideoPlayerModal(interviewId, data);
             } else {
                 // More detailed error message
@@ -1365,4 +1365,3 @@ function getCookie(name) {
 }
 </script>
 {% endblock %}
-

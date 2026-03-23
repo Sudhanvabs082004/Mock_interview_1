@@ -26,6 +26,8 @@ import pytz
 import requests
 import threading
 import re
+import cv2
+import numpy as np
 
 from dotenv import load_dotenv
 import random
@@ -40,6 +42,8 @@ LOCAL_AUDIO_RESPONSES_DIR = os.path.join(settings.MEDIA_ROOT, 'audio_responses')
 LOCAL_VIDEO_RECORDINGS_DIR = os.path.join(settings.MEDIA_ROOT, 'video_recordings')
 SERVER_TTS_ENABLED = getattr(settings, 'VOICE_INTERVIEW_TTS_ENABLED', False)
 INTERVIEW_ANALYSIS_MODEL = settings.OPENROUTER_CONFIG.get('MODEL', 'deepseek/deepseek-r1-0528')
+FACE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+EYE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
 
 
 def get_random_question(interview, excluded_question_ids=None):
@@ -188,6 +192,244 @@ def _decode_base64_payload(encoded_data):
         return base64.urlsafe_b64decode(normalized_data)
 
 
+def _build_live_detection_payload(status, face_count, eyes_detected=0, face_center_offset=0.0):
+    return {
+        'status': status,
+        'face_count': face_count,
+        'eyes_detected': eyes_detected,
+        'face_center_offset': round(face_center_offset, 3),
+        'face_detected': face_count > 0,
+        'multiple_faces': face_count > 1,
+        'looking_away': status == 'looking_away',
+        'no_face': face_count == 0,
+        'device_detected': status == 'device_detected',
+        'device_count': 0,
+    }
+
+
+def _rectangles_overlap(rect_a, rect_b):
+    ax, ay, aw, ah = rect_a
+    bx, by, bw, bh = rect_b
+
+    overlap_x = max(0, min(ax + aw, bx + bw) - max(ax, bx))
+    overlap_y = max(0, min(ay + ah, by + bh) - max(ay, by))
+    overlap_area = overlap_x * overlap_y
+    min_area = max(1, min(aw * ah, bw * bh))
+    return (overlap_area / min_area) > 0.2
+
+
+def _detect_visible_device(frame, faces):
+    """Heuristic gadget detection for phone/tablet-like rectangular objects."""
+    try:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blurred, 80, 180)
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        frame_area = frame.shape[0] * frame.shape[1]
+        device_boxes = []
+
+        for contour in contours:
+            perimeter = cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, 0.03 * perimeter, True)
+            if len(approx) != 4:
+                continue
+
+            x, y, w, h = cv2.boundingRect(approx)
+            area = w * h
+            if area < frame_area * 0.015 or area > frame_area * 0.25:
+                continue
+
+            aspect_ratio = w / float(max(h, 1))
+            is_phone_like = 0.35 <= aspect_ratio <= 0.85
+            is_tablet_like = 1.2 <= aspect_ratio <= 1.9
+            if not (is_phone_like or is_tablet_like):
+                continue
+
+            if any(_rectangles_overlap((x, y, w, h), tuple(face)) for face in faces):
+                continue
+
+            if y < frame.shape[0] * 0.12:
+                continue
+
+            device_boxes.append((x, y, w, h))
+
+        return device_boxes
+    except Exception as exc:
+        logger.error("Device detection failed: %s", exc)
+        return []
+
+
+def _analyze_live_frame(frame_data_b64):
+    """Lightweight live proctoring analysis that does not depend on HDFS."""
+    try:
+        frame_bytes = _decode_base64_payload(frame_data_b64)
+        frame_array = np.frombuffer(frame_bytes, dtype=np.uint8)
+        frame = cv2.imdecode(frame_array, cv2.IMREAD_COLOR)
+        if frame is None:
+            return {
+                'success': False,
+                'error': 'Could not decode frame',
+                'detection': _build_live_detection_payload('analysis_unavailable', 0),
+            }
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = FACE_CASCADE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40))
+        face_count = len(faces)
+
+        if face_count == 0:
+            return {
+                'success': True,
+                'detection': _build_live_detection_payload('no_face', 0),
+            }
+
+        if face_count > 1:
+            return {
+                'success': True,
+                'detection': _build_live_detection_payload('multiple_faces', face_count),
+            }
+
+        x, y, w, h = max(faces, key=lambda face: face[2] * face[3])
+        face_roi_gray = gray[y:y + h, x:x + w]
+        eyes = EYE_CASCADE.detectMultiScale(face_roi_gray, scaleFactor=1.1, minNeighbors=5, minSize=(12, 12))
+        device_boxes = _detect_visible_device(frame, faces)
+
+        frame_center_x = frame.shape[1] / 2.0
+        face_center_x = x + (w / 2.0)
+        face_center_offset = abs(face_center_x - frame_center_x) / max(frame.shape[1], 1)
+
+        if device_boxes:
+            status = 'device_detected'
+        elif face_center_offset > 0.18:
+            status = 'looking_away'
+        elif len(eyes) == 0:
+            status = 'eyes_not_visible'
+        else:
+            status = 'focused'
+
+        detection = _build_live_detection_payload(
+            status=status,
+            face_count=face_count,
+            eyes_detected=len(eyes),
+            face_center_offset=face_center_offset,
+        )
+        detection['device_detected'] = bool(device_boxes)
+        detection['device_count'] = len(device_boxes)
+
+        return {
+            'success': True,
+            'detection': detection,
+        }
+    except Exception as exc:
+        logger.error("Live frame detection failed: %s", exc)
+        return {
+            'success': False,
+            'error': str(exc),
+            'detection': _build_live_detection_payload('analysis_unavailable', 0),
+        }
+
+
+def _store_live_detection_event(interview, detection):
+    """Persist live detection events server-side for reporting reliability."""
+    try:
+        if not detection:
+            return
+
+        voice_session = VoiceInterviewSession.objects.filter(interview=interview).first()
+        if not voice_session:
+            return
+
+        session_data = voice_session.session_data or {}
+        detection_summary = session_data.get('detection_summary') or {}
+        events = detection_summary.get('events') or []
+
+        question_number = voice_session.current_question_number or 0
+        status = detection.get('status') or 'unknown'
+        timestamp = timezone.now().isoformat()
+
+        message_map = {
+            'focused': 'Candidate remained focused and visible on screen',
+            'looking_away': 'Candidate appeared to look away from the screen',
+            'multiple_faces': 'Multiple faces were detected in the frame',
+            'no_face': 'No face was detected in the frame',
+            'eyes_not_visible': 'Eyes were not clearly visible in the frame',
+            'device_detected': 'A gadget or handheld device was detected in the webcam frame',
+            'analysis_unavailable': 'Live proctoring analysis was unavailable for this frame',
+        }
+
+        signature = f"{question_number}:{status}:{detection.get('face_count', 0)}:{detection.get('device_count', 0)}"
+        last_signature = detection_summary.get('last_signature')
+        last_saved_at = detection_summary.get('last_saved_at')
+
+        if last_signature == signature and last_saved_at:
+            try:
+                last_saved_dt = datetime.fromisoformat(last_saved_at)
+                if timezone.is_naive(last_saved_dt):
+                    last_saved_dt = timezone.make_aware(last_saved_dt, timezone.get_current_timezone())
+                if (timezone.now() - last_saved_dt).total_seconds() < 8:
+                    return
+            except Exception:
+                pass
+
+        events.append({
+            'type': status,
+            'message': message_map.get(status, status),
+            'timestamp': timestamp,
+            'question_number': question_number,
+            'face_count': detection.get('face_count', 0),
+            'eyes_detected': detection.get('eyes_detected', 0),
+            'device_count': detection.get('device_count', 0),
+        })
+
+        session_data['detection_summary'] = {
+            'event_count': len(events),
+            'events': events,
+            'last_signature': signature,
+            'last_saved_at': timestamp,
+            'saved_at': timestamp,
+        }
+        voice_session.session_data = session_data
+        voice_session.save(update_fields=['session_data', 'updated_at'])
+    except Exception as exc:
+        logger.error("Failed to persist live detection event: %s", exc)
+
+
+def _store_proctoring_violation(interview, violation):
+    try:
+        if not violation:
+            return
+
+        voice_session = VoiceInterviewSession.objects.filter(interview=interview).first()
+        if not voice_session:
+            return
+
+        session_data = voice_session.session_data or {}
+        proctoring_summary = session_data.get('proctoring_summary') or {}
+        violations = proctoring_summary.get('violations') or []
+
+        signature = (
+            f"{violation.get('type', 'unknown')}:"
+            f"{violation.get('question_number', 0)}:"
+            f"{violation.get('timestamp', '')}"
+        )
+        last_signature = proctoring_summary.get('last_signature')
+        if signature == last_signature:
+            return
+
+        violations.append(violation)
+        session_data['proctoring_summary'] = {
+            'violation_count': len(violations),
+            'violations': violations,
+            'proctoring_started_at': proctoring_summary.get('proctoring_started_at'),
+            'last_signature': signature,
+            'saved_at': timezone.now().isoformat(),
+        }
+        voice_session.session_data = session_data
+        voice_session.save(update_fields=['session_data', 'updated_at'])
+    except Exception as exc:
+        logger.error("Failed to persist proctoring violation: %s", exc)
+
+
 def _persist_video_recording(interview, frames_record):
     local_video_path = _get_local_video_recording_path(interview)
     video_bytes = None
@@ -326,18 +568,21 @@ Interview metadata:
 - Total questions answered: {len(context_entries)}
 
 Evaluate the candidate only from the question/answer transcript below.
-This evaluation must be strict and accuracy-first, not encouraging.
+This evaluation should be balanced, fair, and constructive.
+Be honest about gaps, but do not make the scoring unnecessarily harsh.
 
 Scoring rules:
 - 90-100: exceptional, consistently correct, deep, precise, interview-ready answers.
-- 75-89: strong answers with minor gaps, mostly correct, solid technical depth.
-- 60-74: mixed performance, partial correctness, shallow depth, noticeable gaps.
-- 40-59: weak performance, multiple incorrect or vague answers, poor structure.
-- 0-39: mostly wrong, irrelevant, extremely shallow, or "I don't know" type answers.
+- 75-89: strong answers with some minor gaps, mostly correct, good technical depth.
+- 60-74: acceptable to good answers, partial correctness, some shallow areas, but meaningful effort shown.
+- 40-59: weak or inconsistent answers, noticeable gaps, limited structure.
+- 0-39: mostly wrong, irrelevant, extremely shallow, or repeated inability to answer.
 - Penalize confidently incorrect answers more than cautious uncertainty.
 - Do not reward answer length unless it adds correct technical content.
-- If answers are vague, generic, or miss the question, keep technical_score and overall_score low.
+- If answers are vague, generic, or miss the question, reduce technical_score and overall_score, but keep the tone constructive.
 - For this technical interview, overall_score should stay close to technical_score and should not exceed it by more than 5 points.
+- Strengths and improvements should be encouraging, specific, and useful.
+- Summary should explain what the candidate did reasonably well and what would improve the performance further.
 
 Return a strict JSON object with scores from 0 to 100 and concise bullet-style feedback.
 
@@ -405,23 +650,23 @@ def _apply_scoring_guardrails(scores, context_entries):
         return scores
 
     if metrics['weak_ratio'] >= 0.6:
-        scores['technical_score'] = min(scores['technical_score'], 38.0)
-        scores['communication_score'] = min(scores['communication_score'], 48.0)
-        scores['confidence_score'] = min(scores['confidence_score'], 42.0)
-        scores['overall_score'] = min(scores['overall_score'], 42.0)
+        scores['technical_score'] = min(scores['technical_score'], 48.0)
+        scores['communication_score'] = min(scores['communication_score'], 56.0)
+        scores['confidence_score'] = min(scores['confidence_score'], 52.0)
+        scores['overall_score'] = min(scores['overall_score'], 52.0)
     elif metrics['weak_ratio'] >= 0.35:
-        scores['technical_score'] = min(scores['technical_score'], 50.0)
-        scores['communication_score'] = min(scores['communication_score'], 58.0)
-        scores['confidence_score'] = min(scores['confidence_score'], 54.0)
-        scores['overall_score'] = min(scores['overall_score'], 55.0)
+        scores['technical_score'] = min(scores['technical_score'], 58.0)
+        scores['communication_score'] = min(scores['communication_score'], 64.0)
+        scores['confidence_score'] = min(scores['confidence_score'], 60.0)
+        scores['overall_score'] = min(scores['overall_score'], 62.0)
 
     if metrics['avg_length'] < 6:
-        scores['technical_score'] = min(scores['technical_score'], 45.0)
-        scores['communication_score'] = min(scores['communication_score'], 52.0)
-        scores['confidence_score'] = min(scores['confidence_score'], 50.0)
-        scores['overall_score'] = min(scores['overall_score'], 50.0)
+        scores['technical_score'] = min(scores['technical_score'], 52.0)
+        scores['communication_score'] = min(scores['communication_score'], 58.0)
+        scores['confidence_score'] = min(scores['confidence_score'], 56.0)
+        scores['overall_score'] = min(scores['overall_score'], 56.0)
     elif metrics['avg_length'] < 12:
-        scores['overall_score'] = min(scores['overall_score'], 64.0)
+        scores['overall_score'] = min(scores['overall_score'], 70.0)
 
     weighted_overall = round(
         (scores['technical_score'] * 0.55) +
@@ -442,9 +687,9 @@ def _fallback_interview_scores(context_entries):
     avg_length = metrics['avg_length']
     weak_penalty = metrics['weak_ratio'] * 30.0
 
-    technical_score = min(72.0, max(18.0, 18.0 + avg_length * 1.5 - weak_penalty))
-    communication_score = min(76.0, max(24.0, 24.0 + avg_length * 1.25 - (metrics['weak_ratio'] * 18.0)))
-    confidence_score = min(74.0, max(20.0, 20.0 + avg_length * 1.1 - (metrics['weak_ratio'] * 24.0)))
+    technical_score = min(78.0, max(28.0, 28.0 + avg_length * 1.35 - weak_penalty))
+    communication_score = min(82.0, max(34.0, 34.0 + avg_length * 1.15 - (metrics['weak_ratio'] * 16.0)))
+    confidence_score = min(80.0, max(30.0, 30.0 + avg_length * 1.0 - (metrics['weak_ratio'] * 20.0)))
     overall_score = round((technical_score * 0.55) + (communication_score * 0.25) + (confidence_score * 0.2), 1)
 
     scores = {
@@ -452,9 +697,9 @@ def _fallback_interview_scores(context_entries):
         'communication_score': round(communication_score, 1),
         'confidence_score': round(confidence_score, 1),
         'overall_score': overall_score,
-        'strengths': ['Completed the interview flow', 'Provided spoken responses for evaluation'],
-        'improvements': ['Add more technical depth', 'Use more structured explanations'],
-        'summary': 'Fallback scoring was used because automated analysis was unavailable.',
+        'strengths': ['Stayed engaged through the interview flow', 'Provided spoken responses that can be evaluated'],
+        'improvements': ['Add more technical depth in key answers', 'Use clearer and more structured explanations'],
+        'summary': 'The report used a fallback evaluation path. The performance shows effort and participation, with room to improve technical depth and answer structure.',
     }
     return _apply_scoring_guardrails(scores, context_entries)
 
@@ -1231,17 +1476,24 @@ def stream_frame(request):
 
         print(f"✅ Frame received | Frame #{frame_number}")
 
-        frames_record = InterviewFrames.objects.filter(
-            interview=interview
-        ).first()
+        frames_record, _created = InterviewFrames.objects.get_or_create(
+            interview=interview,
+            defaults={
+                'kafka_session_id': f"frame_session_{interview.id}",
+                'storage_method': 'kafka' if KAFKA_AVAILABLE else 'hdfs',
+            }
+        )
 
-        if not frames_record or not frames_record.kafka_session_id:
-            print("❌ Kafka session not ready")
-            return JsonResponse({'success': False, 'message': 'Kafka session not ready'})
+        if not frames_record.kafka_session_id:
+            frames_record.kafka_session_id = f"frame_session_{interview.id}"
+            frames_record.save(update_fields=['kafka_session_id'])
 
         print(f"✅ Kafka session ID: {frames_record.kafka_session_id}")
 
         success = False
+        live_detection = _analyze_live_frame(frame_data)
+        if live_detection.get('success'):
+            _store_live_detection_event(interview, live_detection.get('detection'))
 
         print(f"🔍 KAFKA_AVAILABLE = {KAFKA_AVAILABLE}")
 
@@ -1269,6 +1521,8 @@ def stream_frame(request):
                             frame_number + 1
                         )
                         frames_record.save(update_fields=['total_frames'])
+                        interview.has_frame_data = True
+                        interview.save(update_fields=['has_frame_data'])
                         print("💾 Frame count updated")
 
                 else:
@@ -1286,12 +1540,44 @@ def stream_frame(request):
         return JsonResponse({
             'success': success,
             'frame_number': frame_number,
-            'session_id': frames_record.kafka_session_id
+            'session_id': frames_record.kafka_session_id,
+            'live_detection': live_detection.get('detection'),
+            'live_detection_success': live_detection.get('success', False),
         })
 
     except Exception as e:
         print("🚨 STREAM_FRAME ERROR:", str(e))
         return JsonResponse({'success': False})
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def log_proctoring_violation(request):
+    try:
+        if not request.user.is_authenticated:
+            return JsonResponse({'error': 'Authentication required'}, status=401)
+
+        payload = json.loads(request.body)
+        interview_id = payload.get('interview_id')
+        violation = payload.get('violation') or {}
+
+        interview_queryset = Interview.objects.filter(student=request.user)
+        if interview_id:
+            interview_queryset = interview_queryset.filter(id=interview_id)
+
+        interview = interview_queryset.filter(status__in=['in_progress', 'completed']).order_by('-started_at', '-id').first()
+        if not interview:
+            return JsonResponse({'error': 'No matching interview found'}, status=404)
+
+        _store_proctoring_violation(interview, violation)
+        if violation:
+            interview.cheating_detected = True
+            interview.save(update_fields=['cheating_detected'])
+
+        return JsonResponse({'success': True})
+    except Exception as exc:
+        logger.error("Failed to log proctoring violation: %s", exc)
+        return JsonResponse({'error': 'Failed to log proctoring violation'}, status=500)
 # NEW VIDEO RECORDING ENDPOINTS
 
 @csrf_exempt
@@ -1630,17 +1916,21 @@ def get_video_info(request, interview_id):
         else:
             error_message = "Kafka not available"
 
+        effective_total_chunks = chunk_count if chunk_count > 0 else frames_record.total_video_chunks
+        if local_video_available and effective_total_chunks == 0:
+            effective_total_chunks = 1
+
         return JsonResponse({
             'success': True,
             'interview_id': interview_id,
             'video_available': chunk_count > 0 or local_video_available,
-            'total_chunks': chunk_count if chunk_count > 0 else frames_record.total_video_chunks,
+            'total_chunks': effective_total_chunks,
             'video_url': f'/interview/api/kafka-video/{interview_id}/',
             'interview_info': {
                 'student_name': interview.student.get_full_name(),
                 'completed_at': interview.completed_at.isoformat() if interview.completed_at else None,
                 'attempt_number': interview.attempt_number,
-                'duration_estimate': f'~{(chunk_count if chunk_count > 0 else frames_record.total_video_chunks) * 3} seconds' if (chunk_count > 0 or local_video_available) else 'No video recorded',
+                'duration_estimate': f'~{effective_total_chunks * 3} seconds' if (chunk_count > 0 or local_video_available) else 'No video recorded',
                 'interview_status': interview.status
             },
             'debug_info': {
@@ -1936,10 +2226,21 @@ def end_interview(request):
         if not request.user.is_authenticated:
             return JsonResponse({'error': 'Authentication required'}, status=401)
 
-        interview = Interview.objects.filter(
-            student=request.user,
-            status='in_progress'
-        ).first()
+        request_data = {}
+        if request.body:
+            try:
+                request_data = json.loads(request.body)
+            except json.JSONDecodeError:
+                request_data = {}
+
+        interview_id = request_data.get('interview_id')
+        interview_queryset = Interview.objects.filter(student=request.user)
+        if interview_id:
+            interview_queryset = interview_queryset.filter(id=interview_id)
+
+        interview = interview_queryset.filter(
+            status__in=['in_progress', 'completed']
+        ).order_by('-started_at', '-id').first()
 
         if not interview:
             return JsonResponse({'error': 'No active interview found'}, status=404)
@@ -1974,6 +2275,9 @@ def end_interview(request):
 
         # Get voice session to check completion state
         voice_session = VoiceInterviewSession.objects.filter(interview=interview).first()
+        violations = request_data.get('violations') or []
+        detection_events = request_data.get('detection_events') or []
+        violation_count = int(request_data.get('violation_count') or len(violations) or 0)
         
         # Calculate interview duration
         duration_seconds = None
@@ -1993,10 +2297,11 @@ def end_interview(request):
         
         # Update completion tracking fields
         interview.status = 'completed'
-        interview.completed_at = timezone.now()
+        if not interview.completed_at:
+            interview.completed_at = timezone.now()
         interview.interview_duration_seconds = duration_seconds
         if not interview.analysis_completed:
-            interview.processing_status = 'pending'
+            interview.processing_status = interview.processing_status or 'pending'
         
         # Sync questions answered from voice session
         if voice_session:
@@ -2005,6 +2310,26 @@ def end_interview(request):
             # End the voice session if still in progress
             if voice_session.session_status == 'in_progress':
                 voice_session.complete_session(reason='user_ended' if interview.completion_reason == 'user_ended_early' else 'completed')
+
+            session_data = voice_session.session_data or {}
+            existing_detection_summary = session_data.get('detection_summary') or {}
+            existing_events = existing_detection_summary.get('events') or []
+            session_data['proctoring_summary'] = {
+                'violation_count': violation_count,
+                'violations': violations,
+                'proctoring_started_at': request_data.get('proctoring_started_at'),
+                'saved_at': timezone.now().isoformat(),
+            }
+            session_data['detection_summary'] = {
+                'event_count': len(existing_events) if existing_events else len(detection_events),
+                'events': existing_events if existing_events else detection_events,
+                'saved_at': timezone.now().isoformat(),
+            }
+            voice_session.session_data = session_data
+            voice_session.save(update_fields=['session_data', 'updated_at'])
+
+        if violation_count > 0 or detection_events:
+            interview.cheating_detected = True
         
         interview.save()
 
@@ -2029,7 +2354,12 @@ def end_interview(request):
             else:
                 logger.warning("No complete video recording could be persisted for interview %s", interview.id)
 
-        if voice_session and voice_session.current_question_number >= interview.total_questions and not interview.analysis_completed:
+        if (
+            voice_session and
+            voice_session.current_question_number >= interview.total_questions and
+            not interview.analysis_completed and
+            interview.processing_status == 'pending'
+        ):
             interview.processing_status = 'processing'
             interview.save(update_fields=['processing_status'])
             threading.Thread(
@@ -3774,6 +4104,102 @@ def add_watermark(canvas_obj, doc):
     canvas_obj.drawCentredString(0, 0, "STUDENT REPORT")
 
     canvas_obj.restoreState()
+
+
+def _score_to_ten(raw_score):
+    return round((raw_score or 0) / 10.0, 1)
+
+
+def _score_color_hex(score_out_of_ten):
+    normalized = max(0.0, min(10.0, score_out_of_ten)) / 10.0
+    red = int(220 - (180 * normalized))
+    green = int(68 + (120 * normalized))
+    blue = int(68 - (20 * normalized))
+    return f"#{red:02x}{green:02x}{blue:02x}"
+
+
+def _score_color(score_out_of_ten):
+    hex_color = _score_color_hex(score_out_of_ten)
+    return Color(
+        int(hex_color[1:3], 16) / 255.0,
+        int(hex_color[3:5], 16) / 255.0,
+        int(hex_color[5:7], 16) / 255.0,
+    )
+
+
+def _build_report_narratives(analysis_summary):
+    strengths = analysis_summary.get('strengths') or []
+    improvements = analysis_summary.get('improvements') or []
+
+    did_well = "You stayed engaged throughout the interview and gave responses for all major sections."
+    if strengths:
+        did_well = "You did well in areas such as " + ", ".join(strengths[:3]).rstrip('.') + "."
+
+    could_improve = "You could improve by giving more structured and technically deeper answers."
+    if improvements:
+        could_improve = "You could have done better by focusing more on " + ", ".join(improvements[:3]).rstrip('.') + "."
+
+    return {
+        'did_well': did_well,
+        'could_improve': could_improve,
+    }
+
+
+def _get_proctoring_summary(voice_session):
+    if not voice_session or not isinstance(voice_session.session_data, dict):
+        return {
+            'violation_count': 0,
+            'violations': [],
+        }
+
+    proctoring_summary = voice_session.session_data.get('proctoring_summary') or {}
+    return {
+        'violation_count': int(proctoring_summary.get('violation_count') or 0),
+        'violations': proctoring_summary.get('violations') or [],
+    }
+
+
+def _get_detection_summary(voice_session):
+    if not voice_session or not isinstance(voice_session.session_data, dict):
+        return {
+            'event_count': 0,
+            'events': [],
+        }
+
+    detection_summary = voice_session.session_data.get('detection_summary') or {}
+    return {
+        'event_count': int(detection_summary.get('event_count') or 0),
+        'events': detection_summary.get('events') or [],
+    }
+
+
+def _build_question_wise_proctoring_lines(violations, detection_events):
+    question_map = {}
+
+    for violation in violations or []:
+        question_number = violation.get('question_number') or 0
+        question_map.setdefault(question_number, []).append(
+            f"Violation: {violation.get('message', 'Unknown violation')} at {violation.get('timestamp', 'unknown time')}"
+        )
+
+    for event in detection_events or []:
+        question_number = event.get('question_number') or 0
+        question_map.setdefault(question_number, []).append(
+            f"Detection: {event.get('message', 'Unknown detection')} at {event.get('timestamp', 'unknown time')}"
+        )
+
+    if not question_map:
+        return ["No proctoring violations or live detection events were recorded during this interview."]
+
+    lines = []
+    for question_number in sorted(question_map.keys()):
+        heading = f"Question {question_number}" if question_number else "General / Pre-interview"
+        lines.append(f"{heading}:")
+        for item in question_map[question_number]:
+            lines.append(f"- {item}")
+    return lines
+
+
 @login_required
 def download_student_report(request, interview_id):
     """
@@ -3792,6 +4218,9 @@ def download_student_report(request, interview_id):
     analysis_summary = {}
     if voice_session and isinstance(voice_session.session_data, dict):
         analysis_summary = voice_session.session_data.get('analysis_summary', {})
+    proctoring_summary = _get_proctoring_summary(voice_session)
+    detection_summary = _get_detection_summary(voice_session)
+    report_narratives = _build_report_narratives(analysis_summary)
 
     # Title
     title_style = styles['Heading1']
@@ -3856,24 +4285,71 @@ def download_student_report(request, interview_id):
     elements.append(Paragraph("<b>Performance Scores:</b>", styles['Heading3']))
     elements.append(Spacer(1, 10))
 
+    technical_score_ten = _score_to_ten(interview.technical_score)
+    communication_score_ten = _score_to_ten(interview.communication_score)
+    confidence_score_ten = _score_to_ten(interview.confidence_score)
+    overall_score_ten = _score_to_ten(interview.overall_score)
+
     score_data = [
         ['Section', 'Score'],
-        ['Technical Skills', f'{interview.technical_score or 0:.1f} / 100'],
-        ['Communication Skills', f'{interview.communication_score or 0:.1f} / 100'],
-        ['Confidence', f'{interview.confidence_score or 0:.1f} / 100'],
-        ['Overall Score', f'{interview.overall_score or 0:.1f} / 100'],
+        ['Technical Skills', f'{technical_score_ten:.1f} / 10'],
+        ['Communication Skills', f'{communication_score_ten:.1f} / 10'],
+        ['Confidence', f'{confidence_score_ten:.1f} / 10'],
+        ['Overall Score', f'{overall_score_ten:.1f} / 10'],
     ]
 
     score_table = Table(score_data, colWidths=[250, 150])
-    score_table.setStyle(TableStyle([
+    score_table_style = TableStyle([
         ('BACKGROUND', (0,0), (-1,0), colors.darkblue),
         ('TEXTCOLOR',(0,0),(-1,0),colors.white),
         ('GRID', (0,0), (-1,-1), 1, colors.grey),
         ('ALIGN',(1,1),(-1,-1),'CENTER'),
-    ]))
+        ('TEXTCOLOR', (0,1), (-1,-1), colors.white),
+    ])
+
+    row_colors = [
+        _score_color(technical_score_ten),
+        _score_color(communication_score_ten),
+        _score_color(confidence_score_ten),
+        _score_color(overall_score_ten),
+    ]
+    for row_index, row_color in enumerate(row_colors, start=1):
+        score_table_style.add('BACKGROUND', (0, row_index), (-1, row_index), row_color)
+
+    score_table.setStyle(score_table_style)
 
     elements.append(score_table)
     elements.append(Spacer(1, 40))
+
+    elements.append(Paragraph("<b>Proctoring Summary:</b>", styles['Heading3']))
+    elements.append(Spacer(1, 8))
+    elements.append(Paragraph(
+        f"Total violations recorded: {proctoring_summary['violation_count']} | "
+        f"Live detection events recorded: {detection_summary['event_count']}",
+        styles['Normal']
+    ))
+    elements.append(Spacer(1, 8))
+
+    question_wise_lines = _build_question_wise_proctoring_lines(
+        proctoring_summary['violations'],
+        detection_summary['events'],
+    )
+
+    elements.append(ListFlowable(
+        [ListItem(Paragraph(line, styles['Normal'])) for line in question_wise_lines],
+        bulletType='bullet'
+    ))
+    elements.append(Spacer(1, 24))
+
+    elements.append(Paragraph("<b>What You Did Well:</b>", styles['Heading3']))
+    elements.append(Spacer(1, 8))
+    elements.append(Paragraph(report_narratives['did_well'], styles['Normal']))
+    elements.append(Spacer(1, 18))
+
+    elements.append(Paragraph("<b>What You Could Have Done Better:</b>", styles['Heading3']))
+    elements.append(Spacer(1, 8))
+    elements.append(Paragraph(report_narratives['could_improve'], styles['Normal']))
+    elements.append(Spacer(1, 20))
 
     if analysis_summary.get('summary'):
         elements.append(Paragraph("<b>Evaluator Summary:</b>", styles['Heading3']))
@@ -3908,8 +4384,32 @@ def interview_results(request, interview_id):
             student=request.user
         )
 
+    voice_session = VoiceInterviewSession.objects.filter(interview=interview).first()
+    proctoring_summary = _get_proctoring_summary(voice_session)
+
+    display_scores = {
+        'technical': {
+            'value': _score_to_ten(interview.technical_score),
+            'color': _score_color_hex(_score_to_ten(interview.technical_score)),
+        },
+        'communication': {
+            'value': _score_to_ten(interview.communication_score),
+            'color': _score_color_hex(_score_to_ten(interview.communication_score)),
+        },
+        'confidence': {
+            'value': _score_to_ten(interview.confidence_score),
+            'color': _score_color_hex(_score_to_ten(interview.confidence_score)),
+        },
+        'overall': {
+            'value': _score_to_ten(interview.overall_score),
+            'color': _score_color_hex(_score_to_ten(interview.overall_score)),
+        },
+    }
+
     return render(request, 'interview_system/interview_results.html', {
-        'interview': interview
+        'interview': interview,
+        'display_scores': display_scores,
+        'proctoring_summary': proctoring_summary,
     })
 from django.views.decorators.http import require_POST
 
